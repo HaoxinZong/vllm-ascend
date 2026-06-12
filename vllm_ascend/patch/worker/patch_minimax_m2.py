@@ -91,6 +91,8 @@ _DUMP_FULL = _env_flag("MINIMAX_DUMP_FULL")
 _DUMP_PHASE = os.getenv("MINIMAX_DUMP_PHASE", "all").lower()
 _DUMP_FIRST_N_LAYERS = _env_int("MINIMAX_DUMP_FIRST_N_LAYERS", -1)
 _DUMP_LAYERS = _parse_layer_filter(os.getenv("MINIMAX_DUMP_LAYERS"))
+_DUMP_CALL_START = max(0, _env_int("MINIMAX_DUMP_CALL_START", 0))
+_DUMP_CALL_END = _env_int("MINIMAX_DUMP_CALL_END", -1)
 _DUMP_MAX_CALLS = _env_int("MINIMAX_DUMP_MAX_CALLS", 0)
 _DUMP_COUNTS: dict[str, int] = {}
 
@@ -208,9 +210,13 @@ def _dump_minimax_tensor(
     dump_name = _safe_name(name)
     key = f"pp{pp_rank}.tp{tp_rank}.{phase}.{prefix}.{dump_name}"
     count = _DUMP_COUNTS.get(key, 0)
-    if _DUMP_MAX_CALLS > 0 and count >= _DUMP_MAX_CALLS:
-        return
     _DUMP_COUNTS[key] = count + 1
+    if count < _DUMP_CALL_START:
+        return
+    if _DUMP_CALL_END >= 0 and count >= _DUMP_CALL_END:
+        return
+    if _DUMP_MAX_CALLS > 0 and count >= _DUMP_CALL_START + _DUMP_MAX_CALLS:
+        return
 
     pos = None
     if positions is not None:
