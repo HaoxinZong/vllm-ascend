@@ -35,8 +35,17 @@ POINT_ORDER = {
     "attn.out": 8,
     "moe.input": 20,
     "moe.router_logits": 21,
-    "moe.out_before_extra_reduce": 22,
-    "moe.out_after_extra_reduce": 23,
+    "moe.topk_ids_selected": 22,
+    "moe.topk_weights_selected": 23,
+    "moe.expert_map": 24,
+    "moe.log2phy": 25,
+    "moe.topk_ids_after_zero": 26,
+    "moe.topk_weights_after_zero": 27,
+    "moe.topk_ids_after_force_balance": 28,
+    "moe.topk_ids_final": 29,
+    "moe.topk_weights_final": 30,
+    "moe.out_before_extra_reduce": 31,
+    "moe.out_after_extra_reduce": 32,
 }
 
 

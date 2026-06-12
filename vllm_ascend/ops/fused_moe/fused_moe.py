@@ -17,13 +17,21 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
+import os
 
 import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
@@ -87,6 +95,181 @@ def mock_false():
 
 def mock_true():
     return True
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _parse_layer_filter(value: str | None) -> set[int] | None:
+    if not value:
+        return None
+    layers: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                start, end = end, start
+            layers.update(range(start, end + 1))
+        else:
+            layers.add(int(part))
+    return layers
+
+
+_MINIMAX_DUMP_DIR = os.getenv("MINIMAX_DUMP_DIR")
+_MINIMAX_DUMP_TOKENS = _env_int("MINIMAX_DUMP_TOKENS", 4)
+_MINIMAX_DUMP_FULL = _env_flag("MINIMAX_DUMP_FULL")
+_MINIMAX_DUMP_PHASE = os.getenv("MINIMAX_DUMP_PHASE", "all").lower()
+_MINIMAX_DUMP_FIRST_N_LAYERS = _env_int("MINIMAX_DUMP_FIRST_N_LAYERS", -1)
+_MINIMAX_DUMP_LAYERS = _parse_layer_filter(os.getenv("MINIMAX_DUMP_LAYERS"))
+_MINIMAX_DUMP_CALL_START = max(0, _env_int("MINIMAX_DUMP_CALL_START", 0))
+_MINIMAX_DUMP_CALL_END = _env_int("MINIMAX_DUMP_CALL_END", -1)
+_MINIMAX_DUMP_MAX_CALLS = _env_int("MINIMAX_DUMP_MAX_CALLS", 0)
+_MINIMAX_MOE_DUMP_COUNTS: dict[str, int] = {}
+
+if _MINIMAX_DUMP_PHASE not in ("all", "prefill", "decode", "mixed"):
+    _MINIMAX_DUMP_PHASE = "all"
+
+
+def _safe_dump_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def _layer_id_from_name(name: str) -> int | None:
+    parts = name.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "layers":
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _should_dump_moe_layer(layer_id: int | None) -> bool:
+    if _MINIMAX_DUMP_LAYERS is not None:
+        return layer_id in _MINIMAX_DUMP_LAYERS
+    if _MINIMAX_DUMP_FIRST_N_LAYERS >= 0:
+        return layer_id is not None and layer_id < _MINIMAX_DUMP_FIRST_N_LAYERS
+    return True
+
+
+def _first_attn_metadata():
+    if not is_forward_context_available():
+        return None
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except Exception:
+        return None
+
+    if isinstance(attn_metadata, list):
+        for item in attn_metadata:
+            if isinstance(item, dict) and item:
+                return next(iter(item.values()))
+        return None
+    if isinstance(attn_metadata, dict):
+        if not attn_metadata:
+            return None
+        return next(iter(attn_metadata.values()))
+    return attn_metadata
+
+
+def _infer_minimax_dump_phase(tensor: torch.Tensor) -> str:
+    metadata = _first_attn_metadata()
+    if metadata is not None:
+        num_prefills = int(getattr(metadata, "num_prefills", 0) or 0)
+        num_decodes = int(getattr(metadata, "num_decodes", 0) or 0)
+        num_decode_tokens = int(getattr(metadata, "num_decode_tokens", 0) or 0)
+        has_decode = num_decodes > 0 or num_decode_tokens > 0
+        if num_prefills > 0 and has_decode:
+            return "mixed"
+        if num_prefills > 0:
+            return "prefill"
+        if has_decode:
+            return "decode"
+
+    if tensor.ndim >= 1 and tensor.shape[0] > 1:
+        return "prefill"
+    return "decode"
+
+
+def _dump_minimax_moe_tensor(
+    layer: torch.nn.Module,
+    name: str,
+    tensor: torch.Tensor | None,
+) -> None:
+    if not _MINIMAX_DUMP_DIR or tensor is None:
+        return
+
+    module_name = str(getattr(layer, "layer_name", layer.__class__.__name__))
+    prefix = _safe_dump_name(module_name)
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id is None:
+        layer_id = _layer_id_from_name(module_name)
+    else:
+        layer_id = int(layer_id)
+    if not _should_dump_moe_layer(layer_id):
+        return
+
+    phase = _infer_minimax_dump_phase(tensor)
+    if _MINIMAX_DUMP_PHASE != "all" and phase != _MINIMAX_DUMP_PHASE:
+        return
+
+    try:
+        tp_rank = get_tensor_model_parallel_rank()
+        pp_rank = get_pp_group().rank_in_group
+    except Exception:
+        tp_rank = 0
+        pp_rank = 0
+
+    dump_name = _safe_dump_name(name)
+    key = f"pp{pp_rank}.tp{tp_rank}.{phase}.{prefix}.{dump_name}"
+    count = _MINIMAX_MOE_DUMP_COUNTS.get(key, 0)
+    _MINIMAX_MOE_DUMP_COUNTS[key] = count + 1
+    if count < _MINIMAX_DUMP_CALL_START:
+        return
+    if _MINIMAX_DUMP_CALL_END >= 0 and count >= _MINIMAX_DUMP_CALL_END:
+        return
+    if _MINIMAX_DUMP_MAX_CALLS > 0 and count >= _MINIMAX_DUMP_CALL_START + _MINIMAX_DUMP_MAX_CALLS:
+        return
+
+    y = tensor.detach()
+    if not _MINIMAX_DUMP_FULL and _MINIMAX_DUMP_TOKENS > 0 and y.ndim >= 1 and y.shape[0] > _MINIMAX_DUMP_TOKENS:
+        y = y[-_MINIMAX_DUMP_TOKENS:].contiguous()
+    y_cpu = y.contiguous().cpu()
+
+    rank_dir = os.path.join(_MINIMAX_DUMP_DIR, f"pp{pp_rank}_tp{tp_rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+    path = os.path.join(rank_dir, f"{count:06d}_{phase}_{prefix}_{dump_name}.pt")
+    torch.save(
+        {
+            "name": name,
+            "module": prefix,
+            "layer_id": layer_id,
+            "phase": phase,
+            "count": count,
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "moe_comm_type": str(getattr(_EXTRA_CTX, "moe_comm_type", None)),
+            "quant_type": str(getattr(layer, "quant_type", None)),
+            "tensor": y_cpu,
+        },
+        path,
+    )
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -178,6 +361,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
+        _dump_minimax_moe_tensor(layer, "moe.topk_ids_selected", topk_ids)
+        _dump_minimax_moe_tensor(layer, "moe.topk_weights_selected", topk_weights)
+        _dump_minimax_moe_tensor(layer, "moe.expert_map", expert_map)
+        _dump_minimax_moe_tensor(layer, "moe.log2phy", log2phy)
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.21.0"):
                 # In 0.21.0, capturer is a process-wide singleton.
@@ -197,6 +384,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 zero_expert_type=zero_expert_type,
                 hidden_states=x,
             )
+            _dump_minimax_moe_tensor(layer, "moe.topk_ids_after_zero", topk_ids)
+            _dump_minimax_moe_tensor(layer, "moe.topk_weights_after_zero", topk_weights)
 
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
@@ -205,6 +394,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+            _dump_minimax_moe_tensor(layer, "moe.topk_ids_after_force_balance", topk_ids)
+
+        _dump_minimax_moe_tensor(layer, "moe.topk_ids_final", topk_ids)
+        _dump_minimax_moe_tensor(layer, "moe.topk_weights_final", topk_weights)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
