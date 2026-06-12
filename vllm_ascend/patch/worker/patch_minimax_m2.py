@@ -18,6 +18,7 @@
 #
 
 from collections.abc import Iterable
+import os
 
 import torch
 from vllm.distributed import (
@@ -50,6 +51,91 @@ FP8_DTYPES = tuple(
 )
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+_DISABLE_MOE_EXTRA_ALLREDUCE = _env_flag("VLLM_ASCEND_MINIMAX_DISABLE_MOE_EXTRA_ALLREDUCE")
+_DISABLE_FUSED_ATTN = _env_flag("VLLM_ASCEND_MINIMAX_DISABLE_FUSED_ATTN")
+_DUMP_DIR = os.getenv("MINIMAX_DUMP_DIR")
+_DUMP_TOKENS = int(os.getenv("MINIMAX_DUMP_TOKENS", "4"))
+_DUMP_FULL = _env_flag("MINIMAX_DUMP_FULL")
+_DUMP_COUNTS: dict[str, int] = {}
+
+
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def _module_prefix(module: torch.nn.Module) -> str:
+    qkv_proj = getattr(module, "qkv_proj", None)
+    if qkv_proj is not None and getattr(qkv_proj, "prefix", None):
+        return str(qkv_proj.prefix).replace(".qkv_proj", "")
+
+    experts = getattr(module, "experts", None)
+    if experts is not None and getattr(experts, "layer_name", None):
+        return str(experts.layer_name).replace(".experts", "")
+
+    gate = getattr(module, "gate", None)
+    if gate is not None and getattr(gate, "prefix", None):
+        return str(gate.prefix).replace(".gate", "")
+
+    return module.__class__.__name__
+
+
+def _dump_minimax_tensor(
+    module: torch.nn.Module,
+    name: str,
+    tensor: torch.Tensor | None,
+    positions: torch.Tensor | None = None,
+) -> None:
+    if not _DUMP_DIR or tensor is None:
+        return
+
+    try:
+        tp_rank = get_tensor_model_parallel_rank()
+        pp_rank = get_pp_group().rank_in_group
+    except Exception:
+        tp_rank = 0
+        pp_rank = 0
+
+    prefix = _safe_name(_module_prefix(module))
+    dump_name = _safe_name(name)
+    key = f"pp{pp_rank}.tp{tp_rank}.{prefix}.{dump_name}"
+    count = _DUMP_COUNTS.get(key, 0)
+    _DUMP_COUNTS[key] = count + 1
+
+    pos_cpu = None
+    if positions is not None:
+        pos_cpu = positions.detach().cpu()
+
+    y = tensor.detach()
+    if not _DUMP_FULL and _DUMP_TOKENS > 0 and y.ndim >= 1:
+        if y.ndim >= 2 and y.shape[0] == 1 and y.shape[1] > _DUMP_TOKENS:
+            y = y[:, -_DUMP_TOKENS:].contiguous()
+        elif y.shape[0] > _DUMP_TOKENS:
+            y = y[-_DUMP_TOKENS:].contiguous()
+    y_cpu = y.contiguous().cpu()
+
+    rank_dir = os.path.join(_DUMP_DIR, f"pp{pp_rank}_tp{tp_rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+    path = os.path.join(rank_dir, f"{count:06d}_{prefix}_{dump_name}.pt")
+    torch.save(
+        {
+            "name": name,
+            "module": prefix,
+            "count": count,
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "positions": pos_cpu,
+            "tensor": y_cpu,
+        },
+        path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # MiniMaxM2MoE.forward: use maybe_all_reduce_tensor_model_parallel
 # ---------------------------------------------------------------------------
@@ -58,13 +144,17 @@ def _patched_moe_forward(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     num_tokens, hidden_dim = hidden_states.shape
+    _dump_minimax_tensor(self, "moe.input", hidden_states)
     hidden_states = hidden_states.view(-1, hidden_dim)
 
     # router_logits: (num_tokens, n_experts)
     router_logits, _ = self.gate(hidden_states.to(torch.float32))
+    _dump_minimax_tensor(self, "moe.router_logits", router_logits)
     final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
-    if self.tp_size > 1:
+    _dump_minimax_tensor(self, "moe.out_before_extra_reduce", final_hidden_states)
+    if self.tp_size > 1 and not _DISABLE_MOE_EXTRA_ALLREDUCE:
         final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+    _dump_minimax_tensor(self, "moe.out_after_extra_reduce", final_hidden_states)
     return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -99,8 +189,12 @@ def _patch_forward(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    _dump_minimax_tensor(self, "attn.hidden_in", hidden_states, positions)
     qkv, _ = self.qkv_proj(hidden_states)
+    _dump_minimax_tensor(self, "attn.qkv", qkv, positions)
     cos, sin = get_cos_and_sin_slice()
+    _dump_minimax_tensor(self, "attn.cos", cos, positions)
+    _dump_minimax_tensor(self, "attn.sin", sin, positions)
     q, k, v = torch.ops.vllm.split_qkv_tp_rmsnorm_rope(
         input=qkv,
         q_weight=self.q_norm.weight,
@@ -114,12 +208,18 @@ def _patch_forward(
         cos=cos,
         sin=sin,
     )
+    _dump_minimax_tensor(self, "attn.q_after_qknorm_rope", q, positions)
+    _dump_minimax_tensor(self, "attn.k_after_qknorm_rope", k, positions)
+    _dump_minimax_tensor(self, "attn.v", v, positions)
     attn_output = self.attn(q, k, v)
+    _dump_minimax_tensor(self, "attn.out_before_o_proj", attn_output, positions)
     output, _ = self.o_proj(attn_output)
+    _dump_minimax_tensor(self, "attn.out", output, positions)
     return output
 
 
-MiniMaxM2Attention.forward = _patch_forward
+if not _DISABLE_FUSED_ATTN:
+    MiniMaxM2Attention.forward = _patch_forward
 
 
 # ---------------------------------------------------------------------------

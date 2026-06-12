@@ -18,6 +18,7 @@
 #
 
 import logging
+import os
 from functools import partial
 
 import torch
@@ -32,6 +33,13 @@ from vllm.model_executor.layers.mamba.linear_attn import MiniMaxText01RMSNormTP
 from vllm.platforms import current_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+_DISABLE_NPU_QK_NORM = _env_flag("VLLM_ASCEND_MINIMAX_DISABLE_LINEAR_ATTN_NPU_QK_NORM")
 
 _ORIG_QK_METHOD_NAME: str | None = None
 _original_qk_method = None
@@ -64,7 +72,7 @@ def _patched_qk(
     k: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # NPU fast path: kernelized local RMSNorm for q/k, then TP-global rstd correction.
-    if current_platform.device_name == "npu":
+    if current_platform.device_name == "npu" and not _DISABLE_NPU_QK_NORM:
         q, q_inv_rms = torch.ops.npu.npu_rms_norm(q, q_norm.weight, q_norm.variance_epsilon)
         k, k_inv_rms = torch.ops.npu.npu_rms_norm(k, k_norm.weight, k_norm.variance_epsilon)
 
