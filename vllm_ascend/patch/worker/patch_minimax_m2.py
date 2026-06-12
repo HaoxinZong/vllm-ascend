@@ -26,6 +26,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.mamba.linear_attn import MiniMaxText01RMSNormTP
 from vllm.model_executor.models.minimax_m2 import (
     MiniMaxM2Attention,
@@ -55,12 +56,46 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _parse_layer_filter(value: str | None) -> set[int] | None:
+    if not value:
+        return None
+    layers: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                start, end = end, start
+            layers.update(range(start, end + 1))
+        else:
+            layers.add(int(part))
+    return layers
+
+
 _DISABLE_MOE_EXTRA_ALLREDUCE = _env_flag("VLLM_ASCEND_MINIMAX_DISABLE_MOE_EXTRA_ALLREDUCE")
 _DISABLE_FUSED_ATTN = _env_flag("VLLM_ASCEND_MINIMAX_DISABLE_FUSED_ATTN")
 _DUMP_DIR = os.getenv("MINIMAX_DUMP_DIR")
-_DUMP_TOKENS = int(os.getenv("MINIMAX_DUMP_TOKENS", "4"))
+_DUMP_TOKENS = _env_int("MINIMAX_DUMP_TOKENS", 4)
 _DUMP_FULL = _env_flag("MINIMAX_DUMP_FULL")
+_DUMP_PHASE = os.getenv("MINIMAX_DUMP_PHASE", "all").lower()
+_DUMP_FIRST_N_LAYERS = _env_int("MINIMAX_DUMP_FIRST_N_LAYERS", -1)
+_DUMP_LAYERS = _parse_layer_filter(os.getenv("MINIMAX_DUMP_LAYERS"))
+_DUMP_MAX_CALLS = _env_int("MINIMAX_DUMP_MAX_CALLS", 0)
 _DUMP_COUNTS: dict[str, int] = {}
+
+if _DUMP_PHASE not in ("all", "prefill", "decode", "mixed"):
+    _DUMP_PHASE = "all"
 
 
 def _safe_name(name: str) -> str:
@@ -83,6 +118,68 @@ def _module_prefix(module: torch.nn.Module) -> str:
     return module.__class__.__name__
 
 
+def _layer_id_from_prefix(prefix: str) -> int | None:
+    parts = prefix.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "layers":
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _should_dump_layer(layer_id: int | None) -> bool:
+    if _DUMP_LAYERS is not None:
+        return layer_id in _DUMP_LAYERS
+    if _DUMP_FIRST_N_LAYERS >= 0:
+        return layer_id is not None and layer_id < _DUMP_FIRST_N_LAYERS
+    return True
+
+
+def _first_attn_metadata():
+    if not is_forward_context_available():
+        return None
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except Exception:
+        return None
+
+    if isinstance(attn_metadata, list):
+        for item in attn_metadata:
+            if isinstance(item, dict) and item:
+                return next(iter(item.values()))
+        return None
+    if isinstance(attn_metadata, dict):
+        if not attn_metadata:
+            return None
+        return next(iter(attn_metadata.values()))
+    return attn_metadata
+
+
+def _infer_dump_phase(tensor: torch.Tensor) -> str:
+    metadata = _first_attn_metadata()
+    if metadata is not None:
+        num_prefills = int(getattr(metadata, "num_prefills", 0) or 0)
+        num_decodes = int(getattr(metadata, "num_decodes", 0) or 0)
+        num_decode_tokens = int(getattr(metadata, "num_decode_tokens", 0) or 0)
+        has_decode = num_decodes > 0 or num_decode_tokens > 0
+        if num_prefills > 0 and has_decode:
+            return "mixed"
+        if num_prefills > 0:
+            return "prefill"
+        if has_decode:
+            return "decode"
+
+    if tensor.ndim >= 1 and tensor.shape[0] > 1:
+        return "prefill"
+    return "decode"
+
+
+def _should_dump_phase(phase: str) -> bool:
+    return _DUMP_PHASE == "all" or phase == _DUMP_PHASE
+
+
 def _dump_minimax_tensor(
     module: torch.nn.Module,
     name: str,
@@ -92,6 +189,15 @@ def _dump_minimax_tensor(
     if not _DUMP_DIR or tensor is None:
         return
 
+    prefix = _safe_name(_module_prefix(module))
+    layer_id = _layer_id_from_prefix(prefix)
+    if not _should_dump_layer(layer_id):
+        return
+
+    phase = _infer_dump_phase(tensor)
+    if not _should_dump_phase(phase):
+        return
+
     try:
         tp_rank = get_tensor_model_parallel_rank()
         pp_rank = get_pp_group().rank_in_group
@@ -99,31 +205,39 @@ def _dump_minimax_tensor(
         tp_rank = 0
         pp_rank = 0
 
-    prefix = _safe_name(_module_prefix(module))
     dump_name = _safe_name(name)
-    key = f"pp{pp_rank}.tp{tp_rank}.{prefix}.{dump_name}"
+    key = f"pp{pp_rank}.tp{tp_rank}.{phase}.{prefix}.{dump_name}"
     count = _DUMP_COUNTS.get(key, 0)
+    if _DUMP_MAX_CALLS > 0 and count >= _DUMP_MAX_CALLS:
+        return
     _DUMP_COUNTS[key] = count + 1
 
-    pos_cpu = None
+    pos = None
     if positions is not None:
-        pos_cpu = positions.detach().cpu()
+        pos = positions.detach()
 
     y = tensor.detach()
     if not _DUMP_FULL and _DUMP_TOKENS > 0 and y.ndim >= 1:
         if y.ndim >= 2 and y.shape[0] == 1 and y.shape[1] > _DUMP_TOKENS:
             y = y[:, -_DUMP_TOKENS:].contiguous()
+            if pos is not None and pos.ndim >= 2 and pos.shape[0] == 1 and pos.shape[1] > _DUMP_TOKENS:
+                pos = pos[:, -_DUMP_TOKENS:].contiguous()
         elif y.shape[0] > _DUMP_TOKENS:
             y = y[-_DUMP_TOKENS:].contiguous()
+            if pos is not None and pos.ndim >= 1 and pos.shape[0] > _DUMP_TOKENS:
+                pos = pos[-_DUMP_TOKENS:].contiguous()
     y_cpu = y.contiguous().cpu()
+    pos_cpu = pos.contiguous().cpu() if pos is not None else None
 
     rank_dir = os.path.join(_DUMP_DIR, f"pp{pp_rank}_tp{tp_rank}")
     os.makedirs(rank_dir, exist_ok=True)
-    path = os.path.join(rank_dir, f"{count:06d}_{prefix}_{dump_name}.pt")
+    path = os.path.join(rank_dir, f"{count:06d}_{phase}_{prefix}_{dump_name}.pt")
     torch.save(
         {
             "name": name,
             "module": prefix,
+            "layer_id": layer_id,
+            "phase": phase,
             "count": count,
             "tp_rank": tp_rank,
             "pp_rank": pp_rank,
