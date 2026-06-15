@@ -246,7 +246,14 @@ def _dump_minimax_moe_tensor(
         return
 
     y = tensor.detach()
-    if not _MINIMAX_DUMP_FULL and _MINIMAX_DUMP_TOKENS > 0 and y.ndim >= 1 and y.shape[0] > _MINIMAX_DUMP_TOKENS:
+    keep_full = name in ("moe.expert_map", "moe.log2phy")
+    if (
+        not keep_full
+        and not _MINIMAX_DUMP_FULL
+        and _MINIMAX_DUMP_TOKENS > 0
+        and y.ndim >= 1
+        and y.shape[0] > _MINIMAX_DUMP_TOKENS
+    ):
         y = y[-_MINIMAX_DUMP_TOKENS:].contiguous()
     y_cpu = y.contiguous().cpu()
 
@@ -450,8 +457,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+        routed_tensor = getattr(final_hidden_states, "routed_out", final_hidden_states)
+        _dump_minimax_moe_tensor(layer, "moe.fused_experts.routed_out_before_zero_add", routed_tensor)
+
         if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
+            if hasattr(final_hidden_states, "routed_out"):
+                final_hidden_states.routed_out += zero_expert_result
+            else:
+                final_hidden_states += zero_expert_result
+            routed_tensor = getattr(final_hidden_states, "routed_out", final_hidden_states)
+
+        _dump_minimax_moe_tensor(layer, "moe.fused_experts.routed_out", routed_tensor)
         return final_hidden_states
 
 
@@ -795,6 +811,8 @@ class AscendFusedMoE(FusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
+        _dump_minimax_moe_tensor(self, "moe.forward.hidden_in", hidden_states)
+        _dump_minimax_moe_tensor(self, "moe.forward.router_logits", router_logits)
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
@@ -862,6 +880,10 @@ class AscendFusedMoE(FusedMoE):
         mc2_mask = prepare_output.mc2_mask
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
+        _dump_minimax_moe_tensor(self, "moe.prepare.hidden_states", hidden_states)
+        _dump_minimax_moe_tensor(self, "moe.prepare.router_logits", router_logits)
+        _dump_minimax_moe_tensor(self, "moe.prepare.mc2_mask", mc2_mask)
+        _dump_minimax_moe_tensor(self, "moe.prepare.pertoken_scale", pertoken_scale)
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
@@ -891,6 +913,8 @@ class AscendFusedMoE(FusedMoE):
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
         )
+        _dump_minimax_moe_tensor(self, "moe.apply.routed_out", fused_experts_results.routed_out)
+        _dump_minimax_moe_tensor(self, "moe.apply.expert_tokens", fused_experts_results.expert_tokens)
 
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens
@@ -917,6 +941,7 @@ class AscendFusedMoE(FusedMoE):
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
+        _dump_minimax_moe_tensor(self, "moe.finalize.routed_out", routed_out)
 
         if return_with_event:
             return FusedMoEResult(
