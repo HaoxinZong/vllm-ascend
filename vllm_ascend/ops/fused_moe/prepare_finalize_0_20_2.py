@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
+#
+# This debug copy is intended for the vLLM 0.20.2 / vllm-ascend 775cd396
+# MiniMax investigation. Keep it separate from the current mainline
+# prepare_finalize.py when copying files into the good environment.
 
 from abc import ABC, abstractmethod
 import os

@@ -801,6 +801,11 @@ class AscendFusedMoE(FusedMoE):
         _dump_minimax_moe_tensor(self, "moe.forward.router_logits", router_logits)
 
         forward_context = get_forward_context()
+        forward_context.minimax_moe_debug_module = str(
+            getattr(self, "layer_name", self.__class__.__name__))
+        forward_context.minimax_moe_debug_layer_id = getattr(
+            self, "layer_id", _layer_id_from_name(
+                forward_context.minimax_moe_debug_module))
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
         # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
         if self.enable_npugraph_ex_static_kernel and forward_context.all_moe_layers:
