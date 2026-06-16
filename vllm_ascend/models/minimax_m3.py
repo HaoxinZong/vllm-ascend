@@ -835,21 +835,23 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
-    ###########TODO VIT##############
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "language_model.lm_head":"lm_head",
-            "language_model":"model"
+        orig_to_new_prefix={
+            "language_model.model.": "model.",
+            "language_model.lm_head.": "lm_head.",
         }
     )
-    ###########TODO VIT##############
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = _get_text_config(vllm_config)
         quant_config = vllm_config.quant_config
         self.config = config
-        self.quant_config = quant_config
         self.quant_config = quant_config
         if hasattr(vllm_config.model_config, "max_model_len"):
             self.config.max_model_len = vllm_config.model_config.max_model_len
