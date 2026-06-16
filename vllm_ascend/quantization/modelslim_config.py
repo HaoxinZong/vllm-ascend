@@ -571,7 +571,10 @@ class AscendModelSlimConfig(QuantizationConfig):
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):
-            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
+            if (
+                self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping)
+                or f"{prefix}.weight" not in self.quant_description
+            ):
                 logger.debug("Select UnquantizedEmbeddingMethod for %s (layer=%s)", prefix, "VocabParallelEmbedding")
                 return UnquantizedEmbeddingMethod()
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
