@@ -127,7 +127,15 @@ def main() -> None:
     query = load_tensor(args.dump_dir, args.rank, args.phase, args.layer, args.count, "dense_attn.fia.query")
     key = load_tensor(args.dump_dir, args.rank, args.phase, args.layer, args.count, "dense_attn.fia.key")
     value = load_tensor(args.dump_dir, args.rank, args.phase, args.layer, args.count, "dense_attn.fia.value")
-    block_table = load_tensor(args.dump_dir, args.rank, args.phase, args.layer, args.count, "dense_attn.fia.block_table")
+    block_table = load_tensor(
+        args.dump_dir,
+        args.rank,
+        args.phase,
+        args.layer,
+        args.count,
+        "dense_attn.fia.block_table",
+        required=False,
+    )
     actual_q = load_tensor(
         args.dump_dir, args.rank, args.phase, args.layer, args.count, "dense_attn.fia.actual_seq_lengths_q"
     )
@@ -144,7 +152,6 @@ def main() -> None:
     assert query is not None
     assert key is not None
     assert value is not None
-    assert block_table is not None
 
     scale = args.scale
     if scale is None:
@@ -153,7 +160,7 @@ def main() -> None:
     query_npu = query.npu()
     key_npu = key.npu()
     value_npu = value.npu()
-    block_table_npu = block_table.to(torch.int32).npu()
+    block_table_npu = block_table.to(torch.int32).npu() if block_table is not None else None
     attn_mask_npu = attn_mask.npu() if attn_mask is not None else None
 
     kwargs: dict[str, Any] = {
@@ -161,7 +168,6 @@ def main() -> None:
         "key": key_npu,
         "value": value_npu,
         "atten_mask": attn_mask_npu,
-        "block_table": block_table_npu,
         "input_layout": args.input_layout,
         "block_size": args.block_size,
         "actual_seq_lengths": to_actual_seq_lengths(actual_q),
@@ -171,6 +177,8 @@ def main() -> None:
         "scale": float(scale),
         "sparse_mode": args.sparse_mode,
     }
+    if block_table_npu is not None:
+        kwargs["block_table"] = block_table_npu
     if args.pre_tokens is not None:
         kwargs["pre_tokens"] = args.pre_tokens
     if args.next_tokens is not None:
@@ -192,7 +200,7 @@ def main() -> None:
     print(f"  query: {tuple(query.shape)} {query.dtype}")
     print(f"  key: {tuple(key.shape)} {key.dtype}")
     print(f"  value: {tuple(value.shape)} {value.dtype}")
-    print(f"  block_table: {tuple(block_table.shape)} {block_table.dtype}")
+    print(f"  block_table: {None if block_table is None else (tuple(block_table.shape), block_table.dtype)}")
     print(f"  attn_mask: {None if attn_mask is None else (tuple(attn_mask.shape), attn_mask.dtype)}")
     print(f"  actual_seq_lengths: {kwargs['actual_seq_lengths']}")
     print(f"  actual_seq_lengths_kv: {kwargs['actual_seq_lengths_kv']}")
