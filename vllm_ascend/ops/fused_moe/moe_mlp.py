@@ -25,7 +25,6 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_moe_available,
 )
-from vllm_ascend.ops.activation import AscendSwigluOAIAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -84,6 +83,18 @@ def _require_single_tensor_for_swiglu_quant(
     return tensor_or_list
 
 
+def swiglu_oai_forward(
+    x: torch.Tensor,
+    *,
+    alpha: float,
+    beta: float,
+    limit: float,
+) -> torch.Tensor:
+    gate = torch.clamp(x[..., ::2], max=limit)
+    up = torch.clamp(x[..., 1::2], min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + beta)
+
+
 def quant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: list[torch.Tensor] | torch.Tensor,
@@ -106,9 +117,19 @@ def quant_apply_mlp(
     scale_type: torch.dtype | None = None,
     per_token_scale_type: torch.dtype | None = None,
     use_bf16: bool = True,
+    activation: str | None = None,
     swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
     use_w4a8_per_channel_gmm_swiglu: bool = False,
 ) -> torch.Tensor:
+    act_name = getattr(activation, "value", activation)
+    if act_name == "swigluoai":
+        raise NotImplementedError(
+            "Ascend quantized MoE path does not support "
+            "swigluoai yet."
+        )
+
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
 
@@ -361,6 +382,9 @@ def unquant_apply_mlp(
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
+    swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
@@ -379,8 +403,12 @@ def unquant_apply_mlp(
     )[0]
 
     if act_name == "swigluoai":
-        num_experts, _, hidden_size = w1.shape
-        gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
+        gate_up_out = swiglu_oai_forward(
+            gate_up_out,
+            alpha=swiglu_alpha,
+            beta=swiglu_beta,
+            limit=swiglu_limit,
+        )
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
@@ -424,6 +452,8 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
+    swiglu_alpha = mlp_compute_input.swiglu_alpha
+    swiglu_beta = mlp_compute_input.swiglu_beta
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
@@ -437,6 +467,9 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             group_list_type=group_list_type,
             topk_scales=topk_scales,
             need_trans=need_trans,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
     assert w1_scale is not None and w2_scale is not None
@@ -481,6 +514,9 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         scale_type=scale_type,
         per_token_scale_type=per_token_scale_type,
         use_bf16=use_bf16,
+        activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         use_w4a8_per_channel_gmm_swiglu=mlp_compute_input.quant.use_w4a8_per_channel_gmm_swiglu,
     )

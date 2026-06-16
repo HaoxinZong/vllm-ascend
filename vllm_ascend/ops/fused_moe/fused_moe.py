@@ -65,6 +65,8 @@ class FusedMoEResult:
     before_gmm2_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
     swiglu_limit: float = 0.0
+    swiglu_alpha: float = 1.702
+    swiglu_beta: float = 1.0
 
 
 @dataclass
@@ -75,6 +77,8 @@ class FusedMoEEvents:
     before_gmm2: torch.npu.Event | None = field(default=None)
     before_combine: torch.npu.Event | None = field(default=None)
     swiglu_limit: float = 0.0
+    swiglu_alpha: float = 1.702
+    swiglu_beta: float = 1.0
 
 
 def mock_false():
@@ -245,6 +249,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.702),
+                swiglu_beta=getattr(layer, "swiglu_beta", 1.0),
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -436,7 +442,29 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
-        self.swiglu_limit = getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 0)
+        hf_config = self.vllm_config.model_config.hf_config
+        text_config = getattr(
+            self.vllm_config.model_config,
+            "hf_text_config",
+            getattr(hf_config, "text_config", hf_config),
+        )
+        self.swiglu_limit = (
+            self.swiglu_limit
+            if self.swiglu_limit is not None
+            else getattr(text_config, "swiglu_limit", getattr(hf_config, "swiglu_limit", 0))
+        )
+        current_swiglu_alpha = getattr(self, "swiglu_alpha", None)
+        current_swiglu_beta = getattr(self, "swiglu_beta", None)
+        self.swiglu_alpha = (
+            current_swiglu_alpha
+            if current_swiglu_alpha is not None
+            else getattr(text_config, "swiglu_alpha", getattr(hf_config, "swiglu_alpha", 1.702))
+        )
+        self.swiglu_beta = (
+            current_swiglu_beta
+            if current_swiglu_beta is not None
+            else getattr(text_config, "swiglu_beta", getattr(hf_config, "swiglu_beta", 1.0))
+        )
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,
@@ -721,6 +749,8 @@ class AscendFusedMoE(FusedMoE):
                 before_gmm2_evt=fused_experts_results.before_gmm2_evt,
                 before_combine_evt=fused_experts_results.before_combine_evt,
                 swiglu_limit=fused_experts_results.swiglu_limit,
+                swiglu_alpha=fused_experts_results.swiglu_alpha,
+                swiglu_beta=fused_experts_results.swiglu_beta,
             )
         else:
             # The vLLM FusedMoE forward_impl does not return events.
@@ -879,6 +909,8 @@ class AscendFusedMoE(FusedMoE):
                     before_gmm2=fused_moe_results.before_gmm2_evt,
                     before_combine=fused_moe_results.before_combine_evt,
                     swiglu_limit=fused_moe_results.swiglu_limit,
+                    swiglu_alpha=fused_moe_results.swiglu_alpha,
+                    swiglu_beta=fused_moe_results.swiglu_beta,
                 ),
             )
         return shared_out, routed_out
