@@ -124,11 +124,6 @@ def quant_apply_mlp(
     use_w4a8_per_channel_gmm_swiglu: bool = False,
 ) -> torch.Tensor:
     act_name = getattr(activation, "value", activation)
-    if act_name == "swigluoai":
-        raise NotImplementedError(
-            "Ascend quantized MoE path does not support "
-            "swigluoai yet."
-        )
 
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
@@ -212,6 +207,11 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
+            if act_name == "swigluoai":
+                raise NotImplementedError(
+                    "Ascend quantized MoE MC2 path does not support "
+                    "swigluoai yet."
+                )
             hidden_states, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                 x=hidden_states,
                 weight_scale=w1_scale[0],
@@ -258,7 +258,15 @@ def quant_apply_mlp(
         )[0]
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
+        if act_name == "swigluoai":
+            hidden_states = swiglu_oai_forward(
+                hidden_states,
+                alpha=swiglu_alpha,
+                beta=swiglu_beta,
+                limit=swiglu_limit,
+            )
+        else:
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
         before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
@@ -339,7 +347,15 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
-            if HAS_TRITON:
+            if act_name == "swigluoai":
+                hidden_states = swiglu_oai_forward(
+                    hidden_states,
+                    alpha=swiglu_alpha,
+                    beta=swiglu_beta,
+                    limit=swiglu_limit,
+                )
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+            elif HAS_TRITON:
                 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
                 hidden_states, swiglu_out_scale = swiglu_quant(
