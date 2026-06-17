@@ -226,6 +226,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w1_scale_bias = None
             w2_scale_bias = None
 
+        if getattr(layer, "swigluoai_uninterleave", False):
+            activation = "swigluoai_uninterleave"
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -788,6 +791,7 @@ class AscendFusedMoE(FusedMoE):
                 # Execute activation concurrently with gmm2.
 
                 maybe_wait_event(fused_moe_evts.before_gmm2)
+                is_swigluoai_uninterleave = getattr(self, "swigluoai_uninterleave", False)
                 quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                     x=hidden_states,
                     weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
@@ -800,6 +804,8 @@ class AscendFusedMoE(FusedMoE):
                     quant_mode=1,
                     swiglu_mode=1,
                     clamp_limit=fused_moe_evts.swiglu_limit,
+                    glu_alpha=fused_moe_evts.swiglu_alpha if is_swigluoai_uninterleave else 1.0,
+                    glu_bias=fused_moe_evts.swiglu_beta if is_swigluoai_uninterleave else 0.0,
                 )
                 # Execute the down projection concurrently with the combine
                 # communication.

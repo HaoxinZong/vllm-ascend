@@ -105,13 +105,7 @@ def _get_rope_parameters(config: PretrainedConfig) -> dict[str, Any] | None:
 
 
 class MiniMaxM3SwiGLUOAI(nn.Module):
-    """MiniMax-M3 dense/shared-expert activation.
-
-    vLLM 0.21.0 has ``SwigluOAIAndMul`` for interleaved GPT-OSS weights, while
-    MiniMax-M3's ``MergedColumnParallelLinear`` emits packed [all gates; all
-    ups]. Keep the exact MiniMax math locally so model construction and weight
-    loading do not depend on newer vLLM helper APIs.
-    """
+    """MiniMax-M3 SwiGLU-OAI activation for packed gate/up outputs."""
 
     def __init__(self, alpha: float, beta: float, limit: float):
         super().__init__()
@@ -244,6 +238,7 @@ class MiniMaxM3MoE(nn.Module):
         )
         self.experts.swiglu_alpha = config.swiglu_alpha
         self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
+        self.experts.swigluoai_uninterleave = True
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -669,53 +664,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             num_experts=self.config.num_local_experts,
         )
 
-    @staticmethod
-    def _load_interleaved_w13_param(
-        moe: FusedMoE,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-        shard_id: str,
-    ) -> bool:
-        local_expert_id = moe._map_global_expert_id_to_local_expert_id(expert_id)
-        if local_expert_id == -1:
-            return False
-
-        expert_data = param.data[local_expert_id]
-        # vLLM 0.21 only has `swigluoai`, whose activation expects w13 to be
-        # interleaved. MiniMax-M3 checkpoints store packed gate/up shards.
-        target = expert_data[0::2] if shard_id == "w1" else expert_data[1::2]
-        if target.shape == loaded_weight.shape:
-            target.copy_(loaded_weight)
-            return True
-
-        shard_size = target.shape[0]
-        start_offset = shard_size * moe.tp_rank
-        available = loaded_weight.shape[0] - start_offset
-        if available <= 0:
-            raise ValueError(
-                "MiniMax-M3 expert shard has no data for this TP rank: "
-                f"expert_id={expert_id}, shard_id={shard_id}, "
-                f"target={tuple(target.shape)}, "
-                f"checkpoint={tuple(loaded_weight.shape)}, "
-                f"tp_rank={moe.tp_rank}."
-            )
-        narrow_size = min(shard_size, available)
-        loaded_weight = loaded_weight.narrow(0, start_offset, narrow_size)
-        target = target.narrow(0, 0, loaded_weight.shape[0])
-        if target.shape[1] > loaded_weight.shape[1]:
-            target = target.narrow(1, 0, loaded_weight.shape[1])
-        if target.shape != loaded_weight.shape:
-            raise ValueError(
-                "MiniMax-M3 expert shard shape mismatch after TP slicing: "
-                f"expert_id={expert_id}, shard_id={shard_id}, "
-                f"target={tuple(target.shape)}, "
-                f"checkpoint={tuple(loaded_weight.shape)}, "
-                f"tp_rank={moe.tp_rank}."
-            )
-        target.copy_(loaded_weight)
-        return True
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
             # (param_name, shard_name, shard_id)
@@ -731,7 +679,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
-        modules_dict = dict(self.named_modules())
         loaded_params: set[str] = set()
         loaded_tensors = 0
         skipped_tensors = 0
@@ -832,29 +779,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         continue
 
                     param = params_dict[name_mapped]
-                    if (
-                        name_mapped.endswith(
-                            (
-                                ".experts.w13_weight",
-                                ".experts.w13_weight_scale",
-                                ".experts.w13_weight_offset",
-                            )
-                        )
-                        and shard_id in {"w1", "w3"}
-                    ):
-                        module_name = name_mapped.rsplit(".w13_", 1)[0]
-                        if self._load_interleaved_w13_param(
-                            modules_dict[module_name],
-                            param,
-                            loaded_weight,
-                            expert_id,
-                            shard_id,
-                        ):
-                            mark_loaded(name_mapped)
-                        else:
-                            mark_skipped("nonlocal_expert")
-                        break
-
                     weight_loader = param.weight_loader
                     success = weight_loader(
                         param,
