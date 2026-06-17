@@ -58,6 +58,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -74,6 +75,9 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+logger = init_logger(__name__)
 
 
 def _get_text_config(vllm_config: VllmConfig) -> PretrainedConfig:
@@ -729,35 +733,55 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
         loaded_params: set[str] = set()
+        loaded_tensors = 0
+        skipped_tensors = 0
+        skipped_reasons: dict[str, int] = {}
+
+        def mark_loaded(param_name: str) -> None:
+            nonlocal loaded_tensors
+            loaded_params.add(param_name)
+            loaded_tensors += 1
+
+        def mark_skipped(reason: str) -> None:
+            nonlocal skipped_tensors
+            skipped_tensors += 1
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+
         for name, loaded_weight in weights:
             if name.startswith("model."):
                 name = name[len("model."):]
             if "mtp." in name:
+                mark_skipped("mtp")
                 continue
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
             elif "scale_inv" in name:
                 name = name.replace("scale_inv", "scale")
             if "rotary_emb.inv_freq" in name:
+                mark_skipped("rotary_emb")
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
+                mark_skipped("spec_decode")
                 continue  # skip spec decode layers for main model
 
             # In this Ascend bring-up the sparse index projections are modeled
             # explicitly rather than folded into a five-way qkv projection.
             if ".index_" in name:
                 if name.endswith(".bias") and name not in params_dict:
+                    mark_skipped("missing_bias")
                     continue
                 if is_pp_missing_parameter(name, self):
+                    mark_skipped("pp_missing")
                     continue
                 if name not in params_dict:
+                    mark_skipped("missing_index_param")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                mark_loaded(name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -769,8 +793,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
+                    mark_skipped("missing_bias")
                     continue
                 if is_pp_missing_parameter(name, self):
+                    mark_skipped("pp_missing")
                     continue
                 if name.endswith((".k_scale", ".v_scale")):
                     remapped_name = maybe_remap_kv_scale_name(name, params_dict)
@@ -780,7 +806,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-                        loaded_params.add(remapped_name)
+                        mark_loaded(remapped_name)
                         break
                 if name not in params_dict:
                     continue
@@ -788,7 +814,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                mark_loaded(name)
                 break
             else:
                 is_expert_weight = False
@@ -800,7 +826,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                     name_mapped = name.replace(weight_name, param_name)
 
                     if is_pp_missing_parameter(name_mapped, self):
-                        continue
+                        mark_skipped("pp_missing")
+                        break
                     if name_mapped not in params_dict:
                         continue
 
@@ -823,7 +850,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                             expert_id,
                             shard_id,
                         ):
-                            loaded_params.add(name_mapped)
+                            mark_loaded(name_mapped)
+                        else:
+                            mark_skipped("nonlocal_expert")
                         break
 
                     weight_loader = param.weight_loader
@@ -836,22 +865,27 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         return_success=True,
                     )
                     if success:
-                        loaded_params.add(name_mapped)
+                        mark_loaded(name_mapped)
                         break
                 else:
                     if is_expert_weight:
+                        mark_skipped("nonlocal_or_unmapped_expert")
                         continue
 
                     if name.endswith(".bias") and name not in params_dict:
+                        mark_skipped("missing_bias")
                         continue
 
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
+                        mark_skipped("kv_scale_remap_missing")
                         continue
 
                     if is_pp_missing_parameter(name, self):
+                        mark_skipped("pp_missing")
                         continue
                     if name not in params_dict:
+                        mark_skipped("missing_param")
                         continue
 
                     param = params_dict[name]
@@ -861,7 +895,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                     if getattr(weight_loader, "supports_moe_loading", False):
                         if loaded_weight.shape == param.shape:
                             default_weight_loader(param, loaded_weight)
-                            loaded_params.add(name)
+                            mark_loaded(name)
                             continue
                         raise ValueError(
                             f"FusedMoE parameter {name!r} reached the "
@@ -871,7 +905,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                             "mapping for this checkpoint weight instead."
                         )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    mark_loaded(name)
+        logger.info(
+            "MiniMax M3 text load_weights loaded %d checkpoint tensors into "
+            "%d parameter names; skipped %d tensors by reason: %s",
+            loaded_tensors,
+            len(loaded_params),
+            skipped_tensors,
+            skipped_reasons,
+        )
         return loaded_params
 
 
@@ -941,15 +983,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        ###########TODO VIT##############
-        weights_ = []
-        for name, weight in weights:
-            if "vision_tower" in name or \
-                "multi_modal_projector" in name or \
-                "patch_merge_mlp" in name:
-                continue
-            weights_.append((name, weight))
-        ###########TODO VIT##############
+        weights_ = (
+            (name, weight)
+            for name, weight in weights
+            if (
+                "vision_tower" not in name
+                and "multi_modal_projector" not in name
+                and "patch_merge_mlp" not in name
+            )
+        )
         return loader.load_weights(weights_, mapper=self.hf_to_vllm_mapper)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
