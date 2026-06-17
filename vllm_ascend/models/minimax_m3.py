@@ -906,7 +906,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         )
                     weight_loader(param, loaded_weight)
                     mark_loaded(name)
-        logger.info(
+        logger.warning(
             "MiniMax M3 text load_weights loaded %d checkpoint tensors into "
             "%d parameter names; skipped %d tensors by reason: %s",
             loaded_tensors,
@@ -983,16 +983,38 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        weights_ = (
-            (name, weight)
-            for name, weight in weights
-            if (
-                "vision_tower" not in name
-                and "multi_modal_projector" not in name
-                and "patch_merge_mlp" not in name
-            )
+        raw_tensors = 0
+        text_tensors = 0
+        skipped_multimodal_tensors = 0
+
+        def text_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            nonlocal raw_tensors, text_tensors, skipped_multimodal_tensors
+            for name, weight in weights:
+                raw_tensors += 1
+                if (
+                    "vision_tower" in name
+                    or "multi_modal_projector" in name
+                    or "patch_merge_mlp" in name
+                ):
+                    skipped_multimodal_tensors += 1
+                    continue
+                text_tensors += 1
+                yield name, weight
+
+        logger.warning("MiniMax M3 top-level load_weights entered")
+        loaded_params = loader.load_weights(
+            text_weights(), mapper=self.hf_to_vllm_mapper
         )
-        return loader.load_weights(weights_, mapper=self.hf_to_vllm_mapper)
+        logger.warning(
+            "MiniMax M3 top-level load_weights saw %d checkpoint tensors, "
+            "passed %d text tensors, skipped %d multimodal tensors, "
+            "returned %d loaded parameter names",
+            raw_tensors,
+            text_tensors,
+            skipped_multimodal_tensors,
+            len(loaded_params),
+        )
+        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
