@@ -420,8 +420,11 @@ class AscendFusedMoE(FusedMoE):
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.local_num_experts = self.global_num_experts // self.ep_size
-        self.expert_map_manager._local_num_experts = self.local_num_experts
-        self.expert_map_manager._expert_map = self._expert_map
+        if hasattr(self, "expert_map_manager"):
+            self.expert_map_manager._local_num_experts = self.local_num_experts
+            self.expert_map_manager._expert_map = self._expert_map
+        elif not hasattr(self, "expert_mask"):
+            self.expert_mask = None
         if self._expert_map is not None:
             logger.info_once(
                 "[fused_moe/layer] Expert parallelism is enabled."
