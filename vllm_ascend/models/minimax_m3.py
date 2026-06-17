@@ -799,7 +799,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                             shard_id,
                         ):
                             loaded_params.add(name)
-                        continue
+                        break
 
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -832,17 +832,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         if loaded_weight.shape == param.shape:
                             default_weight_loader(param, loaded_weight)
                             loaded_params.add(name)
-                            continue
-                        if (
-                            ".block_sparse_moe.experts." in name
-                            and not any(
-                                f".experts.{expert_id}." in name
-                                for expert_id in range(
-                                    self.config.num_local_experts
-                                )
-                            )
-                            and loaded_weight.dim() + 1 == param.dim()
-                        ):
                             continue
                         raise ValueError(
                             f"FusedMoE parameter {name!r} reached the "
