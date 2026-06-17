@@ -829,7 +829,17 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         param, "weight_loader", default_weight_loader
                     )
                     if getattr(weight_loader, "supports_moe_loading", False):
-                        continue
+                        if loaded_weight.shape == param.shape:
+                            default_weight_loader(param, loaded_weight)
+                            loaded_params.add(name)
+                            continue
+                        raise ValueError(
+                            f"FusedMoE parameter {name!r} reached the "
+                            "fallback loader with an incompatible shape: "
+                            f"checkpoint={tuple(loaded_weight.shape)}, "
+                            f"parameter={tuple(param.shape)}. Add an expert "
+                            "mapping for this checkpoint weight instead."
+                        )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
         return loaded_params
