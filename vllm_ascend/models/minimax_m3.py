@@ -828,6 +828,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if getattr(weight_loader, "supports_moe_loading", False):
+                        continue
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
         return loaded_params
