@@ -32,12 +32,18 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    VllmConfig,
+    get_current_vllm_config,
+)
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -58,6 +64,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.forward_context import get_forward_context
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    get_kv_quant_mode,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -65,7 +78,12 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -75,6 +93,13 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm_ascend.attention.minimax_m3_sparse import (
+    MiniMaxM3Indexer,
+    MiniMaxM3SparseBackend,
+    MiniMaxM3SparseImpl,
+    MiniMaxM3SparseMetadata,
+)
+from vllm_ascend.device.device_op import DeviceOperator
 
 
 logger = init_logger(__name__)
@@ -258,7 +283,7 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class MiniMaxM3Attention(nn.Module):
+class MiniMaxM3Attention(nn.Module, AttentionLayerBase):
     def __init__(
         self,
         hidden_size: int,
@@ -282,6 +307,7 @@ class MiniMaxM3Attention(nn.Module):
         self.hidden_size = hidden_size
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
+        self.layer_name = f"{prefix}.attn"
 
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -305,6 +331,7 @@ class MiniMaxM3Attention(nn.Module):
 
         if self.is_sparse_attention_layer:
             assert sparse_cfg is not None
+            self.sparse_cfg = sparse_cfg
             self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
             self.idx_head_dim = sparse_cfg["sparse_index_dim"]
             # Index heads use a GQA-style sharding (mirrors KV head replication
@@ -403,15 +430,75 @@ class MiniMaxM3Attention(nn.Module):
             self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=rms_norm_eps)
             self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=rms_norm_eps)
 
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
+        if self.is_sparse_attention_layer:
+            vllm_config = get_current_vllm_config()
+            self.kv_cache_dtype = (
+                cache_config.cache_dtype if cache_config is not None else "auto"
+            )
+            self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+                self.kv_cache_dtype,
+                vllm_config.model_config,
+            )
+            self.attn_backend = MiniMaxM3SparseBackend
+            self.impl = MiniMaxM3SparseImpl(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+                topk_blocks=sparse_cfg["sparse_topk_blocks"],
+                sparse_block_size=sparse_cfg["sparse_block_size"],
+            )
+            self.indexer = MiniMaxM3Indexer(
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scaling,
+                topk_blocks=sparse_cfg["sparse_topk_blocks"],
+                sparse_block_size=sparse_cfg["sparse_block_size"],
+                num_index_heads=self.num_idx_heads,
+                index_head_dim=self.idx_head_dim,
+                prefix=self.layer_name,
+                init_blocks=sparse_cfg.get("sparse_init_block", 0),
+                local_blocks=sparse_cfg.get("sparse_local_block", 0),
+                score_type=sparse_cfg.get("sparse_score_type", "max"),
+                cache_config=cache_config,
+                indexer_kv_dtype=getattr(
+                    getattr(vllm_config, "attention_config", None),
+                    "indexer_kv_dtype",
+                    "bf16",
+                ),
+            )
+            compilation_config = vllm_config.compilation_config
+            if self.layer_name in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {self.layer_name}")
+            compilation_config.static_forward_context[self.layer_name] = self
+            self.kv_cache = torch.tensor([])
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                per_layer_sliding_window=attn_window_size,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=self.layer_name,
+            )
+
+    def get_attn_backend(self):
+        if self.is_sparse_attention_layer:
+            return self.attn_backend
+        return self.attn.get_attn_backend()
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        if not self.is_sparse_attention_layer:
+            return self.attn.get_kv_cache_spec(vllm_config)
+        return FullAttentionSpec(
+            block_size=self.sparse_cfg["sparse_block_size"],
             num_kv_heads=self.num_kv_heads,
-            per_layer_sliding_window=attn_window_size,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            head_size=self.head_dim,
+            head_size_v=self.head_dim,
+            dtype=self.kv_cache_torch_dtype,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
     def _qk_norm(
@@ -449,16 +536,53 @@ class MiniMaxM3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         
         if self.is_sparse_attention_layer:
-            # TODO: Replace this dense fallback with the MiniMax-M3 sparse
-            # indexer/top-k path on Ascend. The index projection modules are
-            # still modeled so checkpoint loading succeeds.
-            attn_output = self.attn(q, k, v)
+            attn_output = self._forward_sparse(positions, q, k, v, hidden_states)
             output, _ = self.o_proj(attn_output)
             return output
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _forward_sparse(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return q.new_zeros(q.shape)
+        main_meta = attn_metadata[self.layer_name]
+        index_meta = attn_metadata[self.indexer.index_cache.prefix]
+        assert isinstance(main_meta, MiniMaxM3SparseMetadata)
+        assert isinstance(index_meta, MiniMaxM3SparseMetadata)
+
+        index_q, _ = self.index_q_proj(hidden_states)
+        index_k, _ = self.index_k_proj(hidden_states)
+        index_q, index_k = self._index_qk_norm(index_q, index_k)
+        index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
+
+        num_tokens = main_meta.num_actual_tokens
+        DeviceOperator.reshape_and_cache(
+            key=k[:num_tokens].view(-1, self.num_kv_heads, self.head_dim),
+            value=v[:num_tokens].view(-1, self.num_kv_heads, self.head_dim),
+            key_cache=self.kv_cache[0],
+            value_cache=self.kv_cache[1],
+            slot_mapping=main_meta.slot_mapping,
+        )
+
+        index_cache = self.indexer.index_cache.kv_cache[0, :, :, 0, :]
+        flat_index_cache = index_cache.view(-1, self.idx_head_dim)
+        flat_index_cache[index_meta.slot_mapping] = index_k[:num_tokens].to(
+            flat_index_cache.dtype
+        )
+
+        output = torch.empty_like(q)
+        topk_idx = self.indexer(index_q)
+        return self.impl.forward(self, q, self.kv_cache, topk_idx, output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
