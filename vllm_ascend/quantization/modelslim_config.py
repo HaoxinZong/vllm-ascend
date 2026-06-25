@@ -418,11 +418,44 @@ class AscendModelSlimConfig(QuantizationConfig):
     def __init__(self, quant_config: dict[str, Any] | None = None):
         super().__init__()
         self.quant_description = quant_config if quant_config is not None else {}
+        self._is_mxfp8_checkpoint = False
+        self._ignored_layers: list[str] = []
+        self._weight_block_size: list[int] | None = None
+        self._detect_foreign_config()
         self._apply_extra_quant_adaptations()
         self.model_type: str | None = None
         self.hf_to_vllm_mapper: WeightsMapper | None = None
         self._mapper_applied = False
         self._add_kvcache_quant_metadata()
+
+    def _detect_foreign_config(self) -> None:
+        """Detect native HF MXFP8 configs and route them through Ascend."""
+        if not self.quant_description:
+            return
+
+        quant_method = self.quant_description.get("quant_method", "")
+        if quant_method != "mxfp8":
+            return
+
+        self._is_mxfp8_checkpoint = True
+        self._weight_block_size = self.quant_description.get("weight_block_size", [1, 32])
+
+        ignored_layers: list[str] = self.quant_description.get("ignored_layers", [])
+        if ignored_layers:
+            normalized: list[str] = []
+            for layer in ignored_layers:
+                clean = layer.replace("language_model.", "")
+                bare = clean.removeprefix("model.")
+                if bare not in normalized:
+                    normalized.append(bare)
+                model_prefixed = f"model.{bare}"
+                if model_prefixed not in normalized:
+                    normalized.append(model_prefixed)
+            self._ignored_layers = normalized
+
+        # This is not a ModelSlim quant_model_description.json dict. Keep the
+        # metadata above and skip ModelSlim key lookup paths.
+        self.quant_description = {}
 
     def __repr__(self) -> str:
         return "AscendModelSlimConfig:\n" + super().__repr__()
@@ -457,8 +490,21 @@ class AscendModelSlimConfig(QuantizationConfig):
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config: Any = None) -> str | None:
         if hf_quant_cfg is not None:
             quant_method = hf_quant_cfg.get("quant_method", None)
-            if not quant_method and torch.npu.is_available():
-                return ASCEND_QUANTIZATION_METHOD
+            if torch.npu.is_available():
+                if not quant_method:
+                    return ASCEND_QUANTIZATION_METHOD
+
+                from vllm.platforms import current_platform
+
+                supported = current_platform.supported_quantization
+                if supported and quant_method not in supported:
+                    logger.warning(
+                        "Model config specifies quantization '%s', which is "
+                        "not directly supported on NPU. Remapping to '%s'.",
+                        quant_method,
+                        ASCEND_QUANTIZATION_METHOD,
+                    )
+                    return ASCEND_QUANTIZATION_METHOD
         return None
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
@@ -517,6 +563,21 @@ class AscendModelSlimConfig(QuantizationConfig):
             return hf_to_vllm_mapper._map_name(prefix)
         return prefix
 
+    @staticmethod
+    def _prefix_is_ignored(vllm_prefix: str, ignored_layers: list[str], model_type: str) -> bool:
+        """Check whether a vLLM layer prefix matches HF ignored_layers."""
+        hf_prefix = vllm_prefix
+        if model_type in ("minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"):
+            hf_prefix = hf_prefix.replace("mlp", "block_sparse_moe")
+
+        for ignored in ignored_layers:
+            clean = ignored.replace("language_model.", "")
+            if clean == hf_prefix:
+                return True
+            if hf_prefix.startswith(clean + ".") or clean.startswith(hf_prefix + "."):
+                return True
+        return False
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional["QuantizeMethodBase"]:
         from .method_adapters import (
             AscendEmbeddingMethod,
@@ -528,7 +589,29 @@ class AscendModelSlimConfig(QuantizationConfig):
         vllm_config = get_current_vllm_config()
         model_type = vllm_config.model_config.hf_config.model_type
 
-        if model_type in ["minimax", "minimax_m2"]:
+        if self._is_mxfp8_checkpoint:
+            if self._ignored_layers and self._prefix_is_ignored(prefix, self._ignored_layers, model_type):
+                return None
+
+            if isinstance(layer, LinearBase):
+                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+
+                return AscendLinearMethod(AscendW8A8MXFP8DynamicLinearMethod())
+            if isinstance(layer, FusedMoE):
+                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicFusedMoEMethod
+
+                return AscendFusedMoEMethod(
+                    AscendW8A8MXFP8DynamicFusedMoEMethod(),
+                    layer.moe_config,
+                    tid2eid,
+                )
+            if isinstance(layer, VocabParallelEmbedding):
+                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+
+                return AscendEmbeddingMethod(AscendW8A8MXFP8DynamicLinearMethod())
+            return None
+
+        if model_type in ["minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"]:
             # Adapt to Minimax architecture: update layer names to MoE convention
             prefix = prefix.replace("mlp", "block_sparse_moe")
             # Normalize the prefix by stripping specific expert indices (e.g., 'experts.0' -> 'experts')
@@ -696,7 +779,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
         # If quant_description is already populated (e.g. from from_config()),
         # there is nothing to do.
-        if self.quant_description:
+        if self.quant_description or self._is_mxfp8_checkpoint:
             return
 
         # Try to get the config file (local or remote)
