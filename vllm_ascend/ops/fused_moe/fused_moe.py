@@ -695,6 +695,10 @@ class AscendFusedMoE(FusedMoE):
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
         # Matrix multiply.
+        activation = self.activation
+        if getattr(self, "swigluoai_uninterleave", False):
+            activation = "swigluoai_uninterleave"
+
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -711,7 +715,7 @@ class AscendFusedMoE(FusedMoE):
             scoring_func=self.scoring_func,
             routed_scaling_factor=self._original_routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
+            activation=activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,
