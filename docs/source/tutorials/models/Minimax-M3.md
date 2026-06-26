@@ -87,7 +87,7 @@ Start the online serving service with the following command:
     --reasoning-parser minimax_m3 \
     --limit-mm-per-prompt '{"image":1}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --additional-config '{"enable_cpu_binding":true, "enable_npugraph_ex": true,"ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
@@ -109,7 +109,7 @@ Start the online serving service with the following command:
   --reasoning-parser minimax_m3 \
   --limit-mm-per-prompt '{"image":1}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --additional-config '{"enable_cpu_binding":true, "enable_npugraph_ex": true,"ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
+  --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
   --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 

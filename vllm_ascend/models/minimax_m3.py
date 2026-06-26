@@ -990,17 +990,21 @@ class MiniMaxM3VLProcessingInfo(BaseProcessingInfo):
         return self.get_hf_processor(**kwargs).video_processor
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None, "video": None}
+        limits: dict[str, int | None] = {"image": None}
+        mm_config = self.ctx.get_mm_config()
+        if "video" in mm_config.limit_per_prompt:
+            limits["video"] = None
+        return limits
 
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        return {
-            "image": self.get_max_image_tokens(),
-            "video": self.get_max_video_tokens(seq_len, mm_counts),
-        }
+        max_tokens = {"image": self.get_max_image_tokens()}
+        if mm_counts.get("video", 0) > 0:
+            max_tokens["video"] = self.get_max_video_tokens(seq_len, mm_counts)
+        return max_tokens
 
     def get_image_size_with_most_features(self) -> ImageSize:
         return _get_minimax_m3_image_size(self.get_image_processor())
