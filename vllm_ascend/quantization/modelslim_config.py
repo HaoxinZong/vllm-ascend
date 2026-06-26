@@ -591,6 +591,20 @@ class AscendModelSlimConfig(QuantizationConfig):
 
         if self._is_mxfp8_checkpoint:
             if self._ignored_layers and self._prefix_is_ignored(prefix, self._ignored_layers, model_type):
+                if isinstance(layer, LinearBase):
+                    from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+                    return AscendUnquantizedLinearMethod()
+                if isinstance(layer, FusedMoE):
+                    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+                    return AscendFusedMoEMethod(
+                        AscendUnquantizedFusedMoEMethod(layer.moe_config),
+                        layer.moe_config,
+                        tid2eid,
+                    )
+                if isinstance(layer, VocabParallelEmbedding):
+                    return UnquantizedEmbeddingMethod()
                 return None
 
             if isinstance(layer, LinearBase):
@@ -606,9 +620,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                     tid2eid,
                 )
             if isinstance(layer, VocabParallelEmbedding):
-                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
-
-                return AscendEmbeddingMethod(AscendW8A8MXFP8DynamicLinearMethod())
+                return UnquantizedEmbeddingMethod()
             return None
 
         if model_type in ["minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"]:

@@ -86,6 +86,16 @@ def _require_single_tensor_for_swiglu_quant(
     return tensor_or_list
 
 
+def _as_tensor_list(
+    tensor_or_list: list[torch.Tensor] | torch.Tensor | None,
+) -> list[torch.Tensor] | None:
+    if tensor_or_list is None:
+        return None
+    if isinstance(tensor_or_list, list):
+        return tensor_or_list
+    return [tensor_or_list]
+
+
 def _ensure_clipped_swiglu_supported() -> None:
     if ASCEND_DEVICE_TYPE == AscendDeviceType.A5:
         raise RuntimeError(
@@ -231,8 +241,8 @@ def quant_apply_mlp(
                     raise RuntimeError("MXFP MoE MLP path requires float8_e8m0fnu scale dtype.")
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
-                    weight=w1,
-                    scale=w1_scale,
+                    weight=_as_tensor_list(w1),
+                    scale=_as_tensor_list(w1_scale),
                     bias=None,
                     per_token_scale=[pertoken_scale],
                     split_item=2,
@@ -413,9 +423,9 @@ def quant_apply_mlp(
                     raise RuntimeError("MXFP MoE MLP path requires float8_e8m0fnu scale dtype.")
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
-                    weight=w1,
-                    scale=w1_scale,
-                    bias=bias1,
+                    weight=_as_tensor_list(w1),
+                    scale=_as_tensor_list(w1_scale),
+                    bias=_as_tensor_list(bias1),
                     per_token_scale=[pertoken_scale],
                     split_item=2,
                     group_list_type=group_list_type,

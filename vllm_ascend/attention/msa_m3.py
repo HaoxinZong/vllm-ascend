@@ -43,15 +43,13 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from vllm_ascend.attention.msa_m3_triton import (
-    SPARSE_BLOCK_SIZE,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
-)
 from vllm_ascend.attention.msa_m3_ops import (
+    SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode_torch,
     minimax_m3_index_score_torch,
     minimax_m3_index_topk_torch,
+    minimax_m3_sparse_attn_decode_torch as minimax_m3_sparse_attn_decode,
+    minimax_m3_sparse_attn_torch as minimax_m3_sparse_attn,
 )
 import vllm_ascend.ops.minimax_m3_sparse  # noqa: F401
 from vllm_ascend.ops.linear import AscendColumnParallelLinear

@@ -101,14 +101,26 @@ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 
 from vllm_ascend.attention.msa_m3 import MiniMaxM3SparseAttention
 from vllm_ascend.models.minimax_m3_vit import MiniMaxVLVisionModel
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 logger = init_logger(__name__)
 
 
+_EMBEDDING_QUANT_AUX_WEIGHT_SUBSTRS = [
+    "embed_tokens.weight_scale",
+    "lm_head.weight_scale",
+]
+
+
 def _is_minimax_m3_text_only() -> bool:
+    disable_vl = os.getenv("VLLM_ASCEND_MINIMAX_M3_DISABLE_VL", "")
+    if disable_vl.lower() in ("1", "true", "yes", "on"):
+        return True
     value = os.getenv("VLLM_ASCEND_MINIMAX_M3_ENABLE_VL", "")
-    return value.lower() not in ("1", "true", "yes", "on")
+    if value:
+        return value.lower() not in ("1", "true", "yes", "on")
+    return False
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -155,6 +167,11 @@ class MiniMaxM3SwiGLUOAI(nn.Module):
         self.limit = float(limit)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            d = x.shape[-1] // 2
+            gate = torch.clamp(x[..., :d], max=self.limit)
+            up = torch.clamp(x[..., d:], min=-self.limit, max=self.limit)
+            return gate * torch.sigmoid(self.alpha * gate) * (up + self.beta)
         return torch.ops.npu.npu_clipped_swiglu(
             x,
             dim=-1,
@@ -889,7 +906,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self, skip_substrs=_EMBEDDING_QUANT_AUX_WEIGHT_SUBSTRS
+        )
         raw_tensors = 0
         text_tensors = 0
         skipped_multimodal_tensors = 0
@@ -1457,12 +1476,12 @@ class MiniMaxM3SparseForConditionalGeneration(
         if not mm_input_by_modality:
             return []
         if self.text_only:
-            raise ValueError(
-                "MiniMax-M3 vision tower is disabled by "
-                "default; set VLLM_ASCEND_MINIMAX_M3_ENABLE_VL=1 to enable it. "
-                "Multimodal inputs are not "
-                "supported in this mode."
+            logger.warning_once(
+                "MiniMax-M3 vision tower is disabled; ignoring multimodal "
+                "inputs. Unset VLLM_ASCEND_MINIMAX_M3_DISABLE_VL or set "
+                "VLLM_ASCEND_MINIMAX_M3_ENABLE_VL=1 to enable vision inputs."
             )
+            return []
 
         multimodal_embeddings: list[torch.Tensor] = []
         for modality, multimodal_input in mm_input_by_modality.items():
@@ -1512,7 +1531,9 @@ class MiniMaxM3SparseForConditionalGeneration(
         return self.language_model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self, skip_substrs=_EMBEDDING_QUANT_AUX_WEIGHT_SUBSTRS
+        )
         raw_tensors = 0
         prefix_counts: dict[str, int] = {}
 
