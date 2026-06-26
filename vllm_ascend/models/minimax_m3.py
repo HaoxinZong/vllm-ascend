@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only MiniMaxM3 model."""
 
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Any
@@ -103,6 +104,11 @@ from vllm_ascend.models.minimax_m3_vit import MiniMaxVLVisionModel
 
 
 logger = init_logger(__name__)
+
+
+def _is_minimax_m3_text_only() -> bool:
+    value = os.getenv("VLLM_ASCEND_MINIMAX_M3_ENABLE_VL", "")
+    return value.lower() not in ("1", "true", "yes", "on")
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -1225,21 +1231,23 @@ class MiniMaxM3VLModel(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         text_config = vllm_config.model_config.hf_text_config
-        vision_config = getattr(config, "vision_config", None)
-        if vision_config is None:
-            raise ValueError("MiniMax-M3 VL requires config.vision_config.")
+        self.text_only = _is_minimax_m3_text_only()
+        if not self.text_only:
+            vision_config = getattr(config, "vision_config", None)
+            if vision_config is None:
+                raise ValueError("MiniMax-M3 VL requires config.vision_config.")
 
-        if isinstance(vision_config, dict):
-            vision_config = PretrainedConfig.from_dict(vision_config)
+            if isinstance(vision_config, dict):
+                vision_config = PretrainedConfig.from_dict(vision_config)
 
-        projector_hidden_size = getattr(config, "projector_hidden_size", None)
-        self.vision_tower = MiniMaxVLVisionModel(
-            config=vision_config,
-            text_hidden_size=text_config.hidden_size,
-            projector_hidden_size=projector_hidden_size,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "vision_tower"),
-        )
+            projector_hidden_size = getattr(config, "projector_hidden_size", None)
+            self.vision_tower = MiniMaxVLVisionModel(
+                config=vision_config,
+                text_hidden_size=text_config.hidden_size,
+                projector_hidden_size=projector_hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
         self.language_model = MiniMaxM3SparseForCausalLM(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
@@ -1324,7 +1332,8 @@ class MiniMaxM3SparseForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "model"),
             )
 
-        self.vision_tower = self.model.vision_tower
+        self.text_only = self.model.text_only
+        self.vision_tower = getattr(self.model, "vision_tower", None)
         self.language_model = self.model.language_model
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -1447,6 +1456,13 @@ class MiniMaxM3SparseForConditionalGeneration(
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
+        if self.text_only:
+            raise ValueError(
+                "MiniMax-M3 vision tower is disabled by "
+                "default; set VLLM_ASCEND_MINIMAX_M3_ENABLE_VL=1 to enable it. "
+                "Multimodal inputs are not "
+                "supported in this mode."
+            )
 
         multimodal_embeddings: list[torch.Tensor] = []
         for modality, multimodal_input in mm_input_by_modality.items():
@@ -1504,6 +1520,18 @@ class MiniMaxM3SparseForConditionalGeneration(
             nonlocal raw_tensors
             for name, weight in weights:
                 raw_tensors += 1
+                is_vision_weight = (
+                    name.startswith("vision_tower.")
+                    or name.startswith("model.vision_tower.")
+                    or name.startswith("multi_modal_projector.")
+                    or name.startswith("model.multi_modal_projector.")
+                    or name.startswith("patch_merge_mlp.")
+                    or name.startswith("model.patch_merge_mlp.")
+                )
+                if self.text_only and is_vision_weight:
+                    bucket = "skipped_vision"
+                    prefix_counts[bucket] = prefix_counts.get(bucket, 0) + 1
+                    continue
                 if name.startswith("language_model."):
                     bucket = "language_model"
                 elif name.startswith("vision_tower."):
