@@ -891,7 +891,16 @@ def is_drafter_moe_model(vllm_config: VllmConfig):
     """Checks if the drafter model is a MoE model by config"""
     global _IS_DRAFTER_MOE_MODEL
     if _IS_DRAFTER_MOE_MODEL is None:
-        model_configs = vllm_config.speculative_config.draft_model_config.hf_text_config.to_dict()
+        speculative_config = vllm_config.speculative_config
+        if speculative_config.method == "extract_hidden_states":
+            # The extract_hidden_states drafter is a cache-only attention layer
+            # (never MoE), but its hf_config is copied from the possibly-MoE
+            # target, so the expert-key scan below would misclassify it. Skip
+            # the scan to keep the drafter DP sync free of a spurious
+            # all_reduce that idle DP ranks never match.
+            _IS_DRAFTER_MOE_MODEL = False
+            return _IS_DRAFTER_MOE_MODEL
+        model_configs = speculative_config.draft_model_config.hf_text_config.to_dict()
         _IS_DRAFTER_MOE_MODEL = _is_contain_expert(model_configs)
         if not model_configs or not model_configs.get("architectures"):
             return _IS_DRAFTER_MOE_MODEL
@@ -1078,6 +1087,31 @@ def is_hierarchical_communication_enabled():
     return (
         os.getenv("HCCL_INTRA_ROCE_ENABLE", "") == "0" and os.getenv("HCCL_INTRA_PCIE_ENABLE", "") == "1"
     ) or get_ascend_config().enable_mc2_hierarchy_comm
+
+
+def is_pd_decode_recompute_scheduler_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """True on PD-disaggregated decode nodes with recompute_scheduler_enable.
+
+    After KV recv, RecomputeScheduler sets num_computed_tokens to N-1 so the
+    decode node recomputes the last prompt token before MTP decode. Worker
+    metadata must not treat that step as prefill.
+    """
+    try:
+        if vllm_config is None:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                vllm_config = get_current_vllm_config()
+            except AssertionError:
+                vllm_config = get_ascend_config().vllm_config
+        if vllm_config is None:
+            return False
+        kv_cfg = vllm_config.kv_transfer_config
+        if kv_cfg is None or not kv_cfg.is_kv_consumer or kv_cfg.is_kv_producer:
+            return False
+        return get_ascend_config().recompute_scheduler_enable
+    except (RuntimeError, AttributeError):
+        return False
 
 
 def should_skip_allreduce_across_dp_group(vllm_config, is_draft_model: bool = False) -> bool:
@@ -1544,9 +1578,16 @@ def get_compressed_pos_and_indices(
 
 
 def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
-    return isinstance(kv_cache_spec, MLAAttentionSpec) and bool(getattr(kv_cache_spec, "cache_sparse_c8", False))
+    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(getattr(kv_cache_spec, "cache_sparse_c8", False))
+
+
+def is_hidden_state_cache_spec(spec) -> bool:
+    """Whether ``spec`` marks an ``extract_hidden_states`` cache-only layer."""
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+    return isinstance(spec, HiddenStateCacheSpec)
 
 
 @lru_cache(maxsize=1)
