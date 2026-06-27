@@ -10,7 +10,7 @@ It is recommended to place the model weight in a shared cache directory.
 
 ### Installation
 
-- Step 1： Download v0.20.2rc1 Docker image
+- Step 1： Download v0.21.0rc1 Docker image
   ```
   docker pull quay.io/ascend/vllm-ascend:v0.21.0rc1-a3
   ```
@@ -57,7 +57,13 @@ It is recommended to place the model weight in a shared cache directory.
   -it $IMAGE bash
   ```
 
-- Step 3: Update vLLM Ascend
+- Step 3: Update vLLM
+  ```
+  cd /vllm-workspace/vllm
+  git checkout v0.23.0
+  ```
+
+- Step 4: Update vLLM Ascend
   ```
   cd /vllm-workspace/vllm-ascend
   git fetch origin pull/10682/merge:pr-10682
