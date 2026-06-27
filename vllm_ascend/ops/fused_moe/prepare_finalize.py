@@ -35,6 +35,7 @@ from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
+from vllm.distributed import tensor_model_parallel_all_reduce
 
 
 class PrepareAndFinalize(ABC):
@@ -418,6 +419,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             MoEPrepareOutput with global tensors.
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
+        self.replace_allreduce = replace_allreduce
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
@@ -515,4 +517,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
         if self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+
+        if (reduce_results and not (self.enable_shared_expert_dp or self.replace_allreduce) and (
+                self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states
