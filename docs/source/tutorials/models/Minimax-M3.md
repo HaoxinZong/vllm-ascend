@@ -114,8 +114,9 @@ Start the online serving service with the following command:
   --gpu-memory-utilization 0.92 \
   --reasoning-parser minimax_m3 \
   --limit-mm-per-prompt '{"image":1}' \
+  --speculative-config '{"model":"${EAGLE3_WEIGHT_PATH}", "method":"eagle3", "num_speculative_tokens":3}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
+  --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant": true}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
   --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
