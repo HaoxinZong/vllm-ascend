@@ -80,6 +80,9 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.minimax_m3_tensor_dump import (
+    dump_minimax_m3_tensor_point as dump_tensor_point,
+)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -339,6 +342,7 @@ class MiniMaxM3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_name = f"{prefix}.attn"
 
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -419,7 +423,18 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        dump_tensor_point(
+            "m3_gqa_attention_input",
+            layer_name=self.layer_name,
+            positions=positions,
+            hidden_states=hidden_states,
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        dump_tensor_point(
+            "m3_gqa_attention_qkv",
+            layer_name=self.layer_name,
+            qkv=qkv,
+        )
         if (
             qkv.device.type != "npu"
             or qkv.dtype != torch.bfloat16
@@ -443,9 +458,25 @@ class MiniMaxM3Attention(nn.Module):
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
             )
-        
+        dump_tensor_point(
+            "m3_gqa_attention_prepare_output",
+            layer_name=self.layer_name,
+            q=q,
+            k=k,
+            v=v,
+        )
         attn_output = self.attn(q, k, v)
+        dump_tensor_point(
+            "m3_gqa_attention_attn_output",
+            layer_name=self.layer_name,
+            attn_output=attn_output,
+        )
         output, _ = self.o_proj(attn_output)
+        dump_tensor_point(
+            "m3_gqa_attention_output",
+            layer_name=self.layer_name,
+            output=output,
+        )
         return output
 
 
@@ -539,25 +570,55 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        dump_tensor_point(
+            "m3_decoder_layer_input",
+            layer_idx=self.layer_idx,
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        dump_tensor_point(
+            "m3_decoder_layer_after_input_norm",
+            layer_idx=self.layer_idx,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         hidden_states = self.self_attn(
             positions=positions,
+            hidden_states=hidden_states,
+        )
+        dump_tensor_point(
+            "m3_decoder_layer_attn_output",
+            layer_idx=self.layer_idx,
             hidden_states=hidden_states,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        dump_tensor_point(
+            "m3_decoder_layer_after_post_norm",
+            layer_idx=self.layer_idx,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
 
         if self.is_layer_sparse:
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
 
+        dump_tensor_point(
+            "m3_decoder_layer_output",
+            layer_idx=self.layer_idx,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         return hidden_states, residual
 
 
@@ -618,6 +679,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        dump_tensor_point(
+            "m3_model_input",
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -628,12 +696,30 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        dump_tensor_point(
+            "m3_model_embed_output",
+            hidden_states=hidden_states,
+            residual=residual,
+        )
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            layer_idx = self.start_layer + idx
+            dump_tensor_point(
+                "m3_model_layer_input",
+                layer_idx=layer_idx,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
             hidden_states, residual = layer(positions, hidden_states, residual)
+            dump_tensor_point(
+                "m3_model_layer_output",
+                layer_idx=layer_idx,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
@@ -643,6 +729,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        dump_tensor_point(
+            "m3_model_output",
+            hidden_states=hidden_states,
+            aux_hidden_states=aux_hidden_states,
+        )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -893,9 +984,18 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        dump_tensor_point(
+            "m3_causal_lm_input",
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            kwargs=kwargs,
+        )
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        dump_tensor_point("m3_causal_lm_output", hidden_states=hidden_states)
         return hidden_states
 
     def compute_logits(
