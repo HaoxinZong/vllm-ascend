@@ -604,6 +604,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                         tid2eid,
                     )
                 if isinstance(layer, VocabParallelEmbedding):
+                    # TODO 环境问题，不支持，待看why
                     return UnquantizedEmbeddingMethod()
                 return None
 
@@ -620,6 +621,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                     tid2eid,
                 )
             if isinstance(layer, VocabParallelEmbedding):
+                # TODO 环境问题，不支持，待看why
                 return UnquantizedEmbeddingMethod()
             return None
 
