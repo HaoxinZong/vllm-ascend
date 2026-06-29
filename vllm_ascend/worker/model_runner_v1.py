@@ -88,6 +88,8 @@ if vllm_version_is("0.21.0"):
         get_global_experts_capturer,
         issue_routing_d2h_copy,
     )
+elif vllm_version_is("0.20.2"):
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 else:
     from vllm.v1.outputs import RoutedExpertsLists
 from vllm.v1.sample.logits_processor import build_logitsprocs
@@ -1915,6 +1917,10 @@ class NPUModelRunner(GPUModelRunner):
                 capturer = get_global_experts_capturer()
                 if capturer is not None:
                     capturer.finalize_pending_copy()
+            elif vllm_version_is("0.20.2"):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.clear_buffer()
             elif self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
 
@@ -2481,6 +2487,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
                     max_model_len=self.max_model_len,
                 )
+            elif vllm_version_is("0.20.2"):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.save_captured_experts(indices=self.cpu_slot_mapping)
             elif self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
@@ -2508,7 +2518,11 @@ class NPUModelRunner(GPUModelRunner):
             **(
                 {"routed_experts_dict": routed_experts_dict}
                 if vllm_version_is("0.21.0")
-                else {"routed_experts": routed_experts_lists}
+                else (
+                    {}
+                    if vllm_version_is("0.20.2")
+                    else {"routed_experts": routed_experts_lists}
+                )
             ),
         )
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):

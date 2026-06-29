@@ -174,7 +174,9 @@ def minimax_m3_index_score_torch(
                         continue
                     k_block = _get_index_block(cache, page)
                     pos_end = min(
-                        SPARSE_BLOCK_SIZE, max(0, seq_len - blk * SPARSE_BLOCK_SIZE)
+                        SPARSE_BLOCK_SIZE,
+                        max(0, seq_len - blk * SPARSE_BLOCK_SIZE),
+                        max(0, q_abs + 1 - blk * SPARSE_BLOCK_SIZE),
                     )
                     if pos_end <= 0:
                         continue

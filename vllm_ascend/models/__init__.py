@@ -2,6 +2,9 @@ from vllm import ModelRegistry
 
 
 def register_model():
+    from vllm_ascend.patch.platform.patch_minimax_m3_config import register_minimax_m3_configs
+
+    register_minimax_m3_configs()
     ModelRegistry.register_model(
         "DeepseekV4ForCausalLM",
         "vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM",

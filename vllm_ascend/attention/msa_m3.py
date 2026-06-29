@@ -1160,6 +1160,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or main_qkv.dtype != torch.bfloat16
             or positions.ndim != 1
             or not getattr(self.rotary_emb, "is_neox_style", True)
+            or not hasattr(torch.ops.vllm, "qkv_rmsnorm_rope")
+            or not hasattr(self.q_norm, "weight_plus_one")
+            or not hasattr(self.k_norm, "weight_plus_one")
         ):
             q, k, v = main_qkv.split(
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
