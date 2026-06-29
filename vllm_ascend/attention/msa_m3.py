@@ -613,37 +613,73 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
 
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+        dump_tensor_point(
+            "m3_sparse_impl_input",
+            layer_name=layer.layer_name,
+            query=query,
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            decode_topk=decode_topk,
+            prefill_topk=prefill_topk,
+            output_before=output[:num_tokens],
+            num_tokens=num_tokens,
+            num_decode_tokens=nd,
+        )
+
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
-            minimax_m3_sparse_attn_decode(
+            decode_q_lens = torch.full(
+                (d.seq_lens.shape[0],),
+                d.decode_query_len,
+                dtype=torch.int64,
+                device=q.device,
+            )
+            decode_topk = decode_topk.contiguous()
+            decode_out = torch.ops._C_ascend.npu_sparse_attention_score(
                 q[:nd],
-                kv_cache,
+                key_cache,
+                value_cache,
                 decode_topk,
-                d.block_table,
-                d.seq_lens,
+                d.block_table.contiguous(),
                 self.num_kv_heads,
                 self.scale,
-                out[:nd],
-                d.decode_query_len,
+                self.block_size,
+                self.topk_blocks,
+                4,
+                select_num_idx=_select_num_idx_from_topk(decode_topk),
+                actual_seq_lengths=decode_q_lens,
+                actual_seq_lengths_kv=d.seq_lens.to(torch.int64).contiguous(),
             )
+            output[:nd].view(-1, self.num_heads, hd).copy_(decode_out)
 
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            minimax_m3_sparse_attn(
-                q[nd:],
-                kv_cache,
+            prefill_q = q[nd:num_tokens]
+            prefill_q_lens = (p.cu_seqlens_q[1:] - p.cu_seqlens_q[:-1]).to(
+                torch.int64
+            )
+            prefill_topk = prefill_topk.contiguous()
+            prefill_out = torch.ops._C_ascend.npu_sparse_attention_score(
+                prefill_q,
+                key_cache,
+                value_cache,
                 prefill_topk,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
+                p.block_table.contiguous(),
                 self.num_kv_heads,
                 self.scale,
-                out[nd:],
+                self.block_size,
+                self.topk_blocks,
+                4,
+                select_num_idx=_select_num_idx_from_topk(prefill_topk),
+                actual_seq_lengths=prefill_q_lens.contiguous(),
+                actual_seq_lengths_kv=p.seq_lens.to(torch.int64).contiguous(),
             )
+            output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
         return output
 
 
