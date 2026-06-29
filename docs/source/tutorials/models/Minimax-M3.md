@@ -72,9 +72,11 @@ It is recommended to place the model weight in a shared cache directory.
 
 ## Deployment
 
-Start the online serving service with the following command:
+Start the online serving service with the following command. This section
+keeps the original A3 deployment examples first, followed by A2 multi-node
+deployment examples.
 
-- For BF16 version
+- A3 BF16 deployment
 
   ```
   export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
@@ -97,7 +99,8 @@ Start the online serving service with the following command:
     --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
-- For W8A8 version
+- A3 W8A8 deployment
+
   ```
   export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
   export HCCL_OP_EXPANSION_MODE="AIV"
@@ -118,6 +121,105 @@ Start the online serving service with the following command:
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant": true}, "multistream_overlap_shared_expert": true, "weight_nz_mode": 2}' \
   --port 11223 > ${LOG_PATH} 2>&1 &
+  ```
+
+- A2 BF16 4-node deployment
+
+  Use 4 A2 nodes with 8 NPUs per node. Set `NODE0_IP` to the rank 0 node,
+  `DP_RANK` to `0-3`, and add `--headless` on non-rank-0 nodes.
+
+  ```
+  local_ip="${LOCAL_IP}"
+  node0_ip="${NODE0_IP}"
+
+  export HCCL_IF_IP=$local_ip
+  export IFNAME="enp189s0f0"
+  export GLOO_SOCKET_IFNAME="$IFNAME"
+  export TP_SOCKET_IFNAME="$IFNAME"
+  export HCCL_SOCKET_IFNAME="$IFNAME"
+
+  export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  export VLLM_ENGINE_READY_TIMEOUT_S=3600
+  export HCCL_CONNECT_TIMEOUT=7200
+  export ASCEND_CONNECT_TIMEOUT=10000
+  export ASCEND_TRANSFER_TIMEOUT=10000
+  export VLLM_RPC_TIMEOUT=1800000
+
+  export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+  export HCCL_OP_EXPANSION_MODE="AIV"
+  export TASK_QUEUE_ENABLE=1
+  export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+
+  vllm serve /dl/weight/minimax_m3_bf16/MiniMax-M3 \
+    --host 0.0.0.0 \
+    --served-model-name minimax-m3 \
+    --trust-remote-code \
+    ${HEADLESS_ARG} \
+    --max-model-len 10240 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --max-num-seqs 4 \
+    --max-num-batched-tokens 2048 \
+    --data-parallel-size 4 \
+    --data-parallel-size-local 1 \
+    --data-parallel-start-rank ${DP_RANK} \
+    --data-parallel-address $node0_ip \
+    --distributed_executor_backend "mp" \
+    --gpu-memory-utilization 0.92 \
+    --reasoning-parser minimax_m3 \
+    --limit-mm-per-prompt '{"image":1}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --additional-config '{"enable_cpu_binding":true,"ascend_compilation_config":{"fuse_qknorm_rope":false, "fuse_norm_quant":false}}' \
+    --port 11223 > ${LOG_PATH} 2>&1 &
+  ```
+
+- A2 W8A8 2-node deployment
+
+  Use 2 A2 nodes with 8 NPUs per node. Set `NODE0_IP` to the rank 0 node,
+  `DP_RANK` to `0` or `1`, and add `--headless` on rank 1.
+
+  ```
+  local_ip="${LOCAL_IP}"
+  node0_ip="${NODE0_IP}"
+
+  export HCCL_IF_IP=$local_ip
+  export IFNAME="enp189s0f0"
+  export GLOO_SOCKET_IFNAME="$IFNAME"
+  export TP_SOCKET_IFNAME="$IFNAME"
+  export HCCL_SOCKET_IFNAME="$IFNAME"
+
+  export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  export VLLM_ENGINE_READY_TIMEOUT_S=3600
+  export HCCL_CONNECT_TIMEOUT=7200
+  export ASCEND_CONNECT_TIMEOUT=10000
+  export ASCEND_TRANSFER_TIMEOUT=10000
+  export VLLM_RPC_TIMEOUT=1800000
+  export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
+
+  export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+  export HCCL_OP_EXPANSION_MODE="AIV"
+  export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+
+  vllm serve /dl/weight/minimax_m3/MiniMax-M3-w8a8 \
+    --host 0.0.0.0 \
+    --served-model-name minimax-m3 \
+    --trust-remote-code \
+    ${HEADLESS_ARG} \
+    --max-model-len 131072 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --max-num-seqs 8 \
+    --data-parallel-size 2 \
+    --data-parallel-size-local 1 \
+    --data-parallel-start-rank ${DP_RANK} \
+    --data-parallel-address $node0_ip \
+    --distributed_executor_backend "mp" \
+    --gpu-memory-utilization 0.92 \
+    --reasoning-parser minimax_m3 \
+    --limit-mm-per-prompt '{"image":1}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_static_kernel": true, "fuse_norm_quant":false}, "multistream_overlap_shared_expert": false, "weight_nz_mode": 2}' \
+    --port 11223 > ${LOG_PATH} 2>&1 &
   ```
 
 **Note**: In the script above, `max-num-seqs` is set to 16, which represents the maximum number of sequences the scheduler can process in a single iteration. Adjust the `max-num-seqs` parameter dynamically based on actual business
