@@ -1054,7 +1054,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         q, k, v, index_q, index_k = self._sparse_prepare(positions, hidden_states)
         attn_out = torch.empty_like(q)
-        attn_out.zero_()
         torch.ops.vllm.minimax_m3_sparse_forward(
             q,
             k,
