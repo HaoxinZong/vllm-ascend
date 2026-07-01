@@ -652,7 +652,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         return output
 
 
-class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+class AscendMiniMaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
     """Fused [q | k | v | index_q | index_k] column-parallel GEMM for M3 sparse layers."""
 
     def __init__(
@@ -668,7 +668,7 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         prefix: str = "",
     ) -> None:
         assert total_num_index_heads == total_num_kv_heads, (
-            "AscendMinimaxM3QKVParallelLinearWithIndexer requires "
+            "AscendMiniMaxM3QKVParallelLinearWithIndexer requires "
             "total_num_index_heads == total_num_kv_heads"
         )
         self.hidden_size = hidden_size
@@ -722,7 +722,7 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             return
         if loaded_shard_id not in ("q", "k", "v", "index_q", "index_k"):
             raise ValueError(
-                "Shard id for AscendMinimaxM3QKVParallelLinearWithIndexer must be "
+                "Shard id for AscendMiniMaxM3QKVParallelLinearWithIndexer must be "
                 "one of 'q', 'k', 'v', 'index_q', 'index_k'; got "
                 f"{loaded_shard_id}."
             )
@@ -811,7 +811,7 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-class AscendMinimaxM3Indexer(AscendColumnParallelLinear):
+class AscendMiniMaxM3IndexerLinear(AscendColumnParallelLinear):
     """Merged [index_q | index_k] projection for M3 sparse layers.
 
     index_q follows KV-head tensor parallel sharding. index_k is always
@@ -1074,7 +1074,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         _register_m3_sparse_packed_modules(quant_config, self._use_fused_qkv_indexer)
 
         if self._use_fused_qkv_indexer:
-            self.qkv_proj = AscendMinimaxM3QKVParallelLinearWithIndexer(
+            self.qkv_proj = AscendMiniMaxM3QKVParallelLinearWithIndexer(
                 hidden_size,
                 self.head_dim,
                 self.total_num_heads,
@@ -1096,7 +1096,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
             )
-            self.indexer_proj = AscendMinimaxM3Indexer(
+            self.indexer_proj = AscendMiniMaxM3Indexer(
                 hidden_size,
                 self.total_idx_heads,
                 self.idx_head_dim,
