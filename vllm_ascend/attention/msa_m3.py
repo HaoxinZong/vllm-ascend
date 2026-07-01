@@ -43,11 +43,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
-
-from vllm_ascend.attention.msa_m3_ops import (
-    minimax_m3_sparse_attn_decode_torch,
-)
-
 from vllm_ascend.attention.msa_m3_triton import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
@@ -621,7 +616,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
-            minimax_m3_sparse_attn_decode_torch(
+            minimax_m3_sparse_attn_decode(
                 q[:nd],
                 kv_cache,
                 decode_topk,
@@ -1308,8 +1303,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Insert KV, build sparse top-k indices, then run sparse attention."""
         self._insert_kv(key, value, index_key)
-        if not get_forward_context().capturing:
-            torch.npu.current_stream().synchronize()
         topk_idx = self.indexer(index_query)
         self.impl.forward(self, query, self.kv_cache, topk_idx, attn_output)
 
