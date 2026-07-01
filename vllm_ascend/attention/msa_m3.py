@@ -1091,7 +1091,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
             )
-            self.indexer_proj = AscendMiniMaxM3Indexer(
+            self.indexer_proj = AscendMiniMaxM3IndexerLinear(
                 hidden_size,
                 self.total_idx_heads,
                 self.idx_head_dim,
