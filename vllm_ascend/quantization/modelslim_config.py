@@ -418,43 +418,61 @@ class AscendModelSlimConfig(QuantizationConfig):
     def __init__(self, quant_config: dict[str, Any] | None = None):
         super().__init__()
         self.quant_description = quant_config if quant_config is not None else {}
+        self.model_type: str | None = None
+        self.hf_to_vllm_mapper: WeightsMapper | None = None
+        self._mapper_applied = False
+
+        # Native mxfp8 checkpoint support (inspired by sglang Fp8Config).
+        # When config.json carries a foreign quantization_config (e.g.
+        # {"quant_method":"mxfp8", ...}), extract the metadata into
+        # dedicated instance attributes so the rest of the code can
+        # consult them directly instead of rummaging through
+        # quant_description / hf_config.
         self._is_mxfp8_checkpoint = False
         self._ignored_layers: list[str] = []
         self._weight_block_size: list[int] | None = None
         self._detect_foreign_config()
         self._apply_extra_quant_adaptations()
-        self.model_type: str | None = None
-        self.hf_to_vllm_mapper: WeightsMapper | None = None
-        self._mapper_applied = False
         self._add_kvcache_quant_metadata()
 
     def _detect_foreign_config(self) -> None:
-        """Detect native HF MXFP8 configs and route them through Ascend."""
+        """If quant_description is a foreign (non-ModelSlim) config dict,
+        extract the fields the ascend runtime needs and clear
+        quant_description so the ModelSlim file-loading path is skipped."""
         if not self.quant_description:
             return
-
         quant_method = self.quant_description.get("quant_method", "")
         if quant_method != "mxfp8":
             return
-
         self._is_mxfp8_checkpoint = True
-        self._weight_block_size = self.quant_description.get("weight_block_size", [1, 32])
 
-        ignored_layers: list[str] = self.quant_description.get("ignored_layers", [])
-        if ignored_layers:
+        block_size = self.quant_description.get("weight_block_size", [1, 32])
+        self._weight_block_size = block_size
+
+        # Normalise ignored_layers: strip "language_model." and keep
+        # both "model." and bare variants for robust prefix matching.
+        ignored: list[str] = self.quant_description.get("ignored_layers", [])
+        if ignored:
             normalized: list[str] = []
-            for layer in ignored_layers:
+            for layer in ignored:
                 clean = layer.replace("language_model.", "")
                 bare = clean.removeprefix("model.")
                 if bare not in normalized:
                     normalized.append(bare)
-                model_prefixed = f"model.{bare}"
-                if model_prefixed not in normalized:
-                    normalized.append(model_prefixed)
+                if f"model.{bare}" not in normalized:
+                    normalized.append(f"model.{bare}")
             self._ignored_layers = normalized
 
-        # This is not a ModelSlim quant_model_description.json dict. Keep the
-        # metadata above and skip ModelSlim key lookup paths.
+        logger.info(
+            "Detected mxfp8 checkpoint -> ascend: "
+            "_is_mxfp8_checkpoint=True, "
+            "_weight_block_size=%s, "
+            "%d ignored layers.",
+            self._weight_block_size,
+            len(self._ignored_layers),
+        )
+        # Clear quant_description so maybe_update_config won't
+        # short-circuit -- the ModelSlim file path is irrelevant.
         self.quant_description = {}
 
     def __repr__(self) -> str:
@@ -565,18 +583,76 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     @staticmethod
     def _prefix_is_ignored(vllm_prefix: str, ignored_layers: list[str], model_type: str) -> bool:
-        """Check whether a vLLM layer prefix matches HF ignored_layers."""
-        hf_prefix = vllm_prefix
-        if model_type in ("minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"):
-            hf_prefix = hf_prefix.replace("mlp", "block_sparse_moe")
+        """Check whether *vllm_prefix* matches any entry in *ignored_layers*.
+
+        The ignored_layers list uses HF-style weight paths (e.g.
+        ``language_model.model.layers.10.block_sparse_moe.gate``) while
+        *vllm_prefix* uses vLLM-internal naming. This method normalises
+        both sides before comparing.
+        """
+        def normalize_prefixes(prefix: str) -> set[str]:
+            prefixes = {prefix}
+            for wrapper in ("model.language_model.", "language_model.", "model."):
+                if prefix.startswith(wrapper):
+                    prefixes.add(prefix[len(wrapper) :])
+            for item in list(prefixes):
+                prefixes.add(item.replace("language_model.", ""))
+                if item.startswith("model."):
+                    prefixes.add(item.removeprefix("model."))
+                else:
+                    prefixes.add(f"model.{item}")
+            if model_type in ("minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"):
+                prefixes |= {item.replace("mlp", "block_sparse_moe") for item in list(prefixes)}
+            return prefixes
+
+        hf_prefixes = normalize_prefixes(vllm_prefix)
 
         for ignored in ignored_layers:
-            clean = ignored.replace("language_model.", "")
-            if clean == hf_prefix:
-                return True
-            if hf_prefix.startswith(clean + ".") or clean.startswith(hf_prefix + "."):
-                return True
+            for clean in normalize_prefixes(ignored):
+                if clean in hf_prefixes:
+                    return True
+                for hf_prefix in hf_prefixes:
+                    # prefix match (e.g. "model.layers.10" matches
+                    # everything inside that layer)
+                    if hf_prefix.startswith(clean + ".") or clean.startswith(hf_prefix + "."):
+                        return True
         return False
+
+    @staticmethod
+    def _log_vocab_embedding_debug(
+        stage: str,
+        prefix: str,
+        layer: torch.nn.Module,
+        model_type: str,
+        ignored_match: bool,
+        ignored_layers: list[str],
+    ) -> None:
+        shard_indices = getattr(layer, "shard_indices", None)
+        ignored_sample = ignored_layers[:8]
+        logger.warning(
+            "[MiniMaxM3 MXFP8 vocab debug] stage=%s prefix=%s layer=%s "
+            "model_type=%s ignored_match=%s org_vocab_size=%s "
+            "num_embeddings=%s num_embeddings_padded=%s "
+            "num_embeddings_per_partition=%s tp_size=%s "
+            "org_start=%s org_end=%s padded_org_start=%s padded_org_end=%s "
+            "ignored_layers_count=%s ignored_layers_sample=%s",
+            stage,
+            prefix,
+            type(layer).__name__,
+            model_type,
+            ignored_match,
+            getattr(layer, "org_vocab_size", None),
+            getattr(layer, "num_embeddings", None),
+            getattr(layer, "num_embeddings_padded", None),
+            getattr(layer, "num_embeddings_per_partition", None),
+            getattr(layer, "tp_size", None),
+            getattr(shard_indices, "org_vocab_start_index", None),
+            getattr(shard_indices, "org_vocab_end_index", None),
+            getattr(shard_indices, "padded_org_vocab_start_index", None),
+            getattr(shard_indices, "padded_org_vocab_end_index", None),
+            len(ignored_layers),
+            ignored_sample,
+        )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional["QuantizeMethodBase"]:
         from .method_adapters import (
@@ -586,44 +662,91 @@ class AscendModelSlimConfig(QuantizationConfig):
             AscendLinearMethod,
         )
 
-        vllm_config = get_current_vllm_config()
-        model_type = vllm_config.model_config.hf_config.model_type
-
+        # When the model checkpoint has a GPU-native quant method
+        # (e.g. mxfp8) that was remapped to ascend, auto-select
+        # W8A8_MXFP8 for all linear and MoE layers.
         if self._is_mxfp8_checkpoint:
-            if self._ignored_layers and self._prefix_is_ignored(prefix, self._ignored_layers, model_type):
-                if isinstance(layer, LinearBase):
-                    from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
-
-                    return AscendUnquantizedLinearMethod()
-                if isinstance(layer, FusedMoE):
-                    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
-
-                    return AscendFusedMoEMethod(
-                        AscendUnquantizedFusedMoEMethod(layer.moe_config),
-                        layer.moe_config,
-                        tid2eid,
+            # Honour ignored_layers from the original config.json so
+            # that layers explicitly excluded from quantization stay
+            # unquantized (e.g. lm_head, embed_tokens, MoE gates).
+            if self._ignored_layers:
+                vllm_config = get_current_vllm_config()
+                model_type = vllm_config.model_config.hf_config.model_type
+                ignored_match = self._prefix_is_ignored(prefix, self._ignored_layers, model_type)
+                # if isinstance(layer, VocabParallelEmbedding):
+                #     self._log_vocab_embedding_debug(
+                #         "check_ignored",
+                #         prefix,
+                #         layer,
+                #         model_type,
+                #         ignored_match,
+                #         self._ignored_layers,
+                #     )
+                if ignored_match:
+                    logger.debug(
+                        "Layer %s is in ignored_layers -- skipping quantization.",
+                        prefix,
                     )
-                if isinstance(layer, VocabParallelEmbedding):
-                    # TODO 环境问题，不支持，待看why
-                    return UnquantizedEmbeddingMethod()
-                return None
+                    if isinstance(layer, LinearBase):
+                        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+                        return AscendUnquantizedLinearMethod()
+                    if isinstance(layer, FusedMoE):
+                        from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+                        return AscendFusedMoEMethod(
+                            AscendUnquantizedFusedMoEMethod(layer.moe_config),
+                            layer.moe_config,
+                            tid2eid,
+                        )
+                    return None
 
             if isinstance(layer, LinearBase):
                 from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 
+                logger.info_once(
+                    "MXFP8 checkpoint: using W8A8_MXFP8 for Linear layers "
+                    "(first seen: %s).",
+                    prefix,
+                )
                 return AscendLinearMethod(AscendW8A8MXFP8DynamicLinearMethod())
             if isinstance(layer, FusedMoE):
                 from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicFusedMoEMethod
 
+                logger.info_once(
+                    "MXFP8 checkpoint: using W8A8_MXFP8 for MoE layers "
+                    "(first seen: %s).",
+                    prefix,
+                )
                 return AscendFusedMoEMethod(
                     AscendW8A8MXFP8DynamicFusedMoEMethod(),
                     layer.moe_config,
                     tid2eid,
                 )
             if isinstance(layer, VocabParallelEmbedding):
-                # TODO 环境问题，不支持，待看why
-                return UnquantizedEmbeddingMethod()
+                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+
+                vllm_config = get_current_vllm_config()
+                model_type = vllm_config.model_config.hf_config.model_type
+                # self._log_vocab_embedding_debug(
+                #     "select_mxfp8_embedding",
+                #     prefix,
+                #     layer,
+                #     model_type,
+                #     False,
+                #     self._ignored_layers,
+                # )
+                logger.info_once(
+                    "MXFP8 checkpoint: using W8A8_MXFP8 for Embedding "
+                    "(first seen: %s).",
+                    prefix,
+                )
+                return AscendEmbeddingMethod(AscendW8A8MXFP8DynamicLinearMethod())
+            # Attention layers: fall through to return None (unquantized)
             return None
+
+        vllm_config = get_current_vllm_config()
+        model_type = vllm_config.model_config.hf_config.model_type
 
         if model_type in ["minimax", "minimax_m2", "minimax_m3", "minimax_m3_vl"]:
             # Adapt to Minimax architecture: update layer names to MoE convention
