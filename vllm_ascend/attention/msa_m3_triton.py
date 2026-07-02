@@ -574,7 +574,7 @@ def _topk_finalize_kernel(
 # grid, while the top-k stage is NPU-oriented. Base-2 score scaling matches
 # prefill.
 # ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["num_kv_chunks", "decode_query_len"])
+@triton.jit
 def _decode_index_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -586,7 +586,7 @@ def _decode_index_score_kernel(
     init_blocks,
     local_blocks,
     sm_scale,
-    decode_query_len,
+    decode_query_len: tl.constexpr,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -598,7 +598,7 @@ def _decode_index_score_kernel(
     stride_s_k,
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    num_kv_chunks,
+    num_kv_chunks: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_b = tl.program_id(0)  # flattened query-token id
@@ -636,7 +636,6 @@ def _decode_index_score_kernel(
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < kv_len
         k = tl.load(
             ik_cache_ptr
             + page * stride_ik_blk
@@ -645,7 +644,9 @@ def _decode_index_score_kernel(
         )  # [N, D]
 
         kq = tl.dot(k, q) * sm_scale_log2e  # [N, H]
-        kq = tl.where(pos_mask[:, None], kq, float("-inf"))
+        if (blk + 1) * BLOCK_SIZE_K > kv_len:
+            pos_mask = pos < kv_len
+            kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
 
         is_init = blk < init_blocks
@@ -663,14 +664,14 @@ def _decode_index_score_kernel(
 # ---------------------------------------------------------------------------
 # Decode local top-k.
 # ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["chunk_blocks", "decode_query_len"])
+@triton.jit
 def _decode_topk_partial_kernel(
     s_ptr,
     scores_partial_ptr,
     indices_partial_ptr,
     seq_lens,
-    chunk_blocks,
-    decode_query_len,
+    chunk_blocks: tl.constexpr,
+    decode_query_len: tl.constexpr,
     stride_s_h,
     stride_s_n,
     stride_s_k,
@@ -823,18 +824,21 @@ def _gqa_sparse_fwd_kernel(
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
-        off_t = tl.arange(0, BLOCK_SIZE_T)
-        topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
-        real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        off_q_load = tl.arange(0, BLOCK_SIZE_Q)
+        off_h = tl.arange(0, BLOCK_SIZE_H)
+        q = tl.load(
+            q_ptr
+            + (q_start + pid_q_j * BLOCK_SIZE_Q + off_q_load[:, None, None])
+            * stride_qn
+            + (pid_h + off_h[None, :, None]) * stride_qh
+            + off_d[None, None, :] * stride_qd,
+            mask=(
+                (pid_q_j * BLOCK_SIZE_Q + off_q_load[:, None, None] < q_len)
+                & (off_h[None, :, None] < gqa_group_size)
+                & d_mask[None, None, :]
+            ),
+            other=0.0,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -845,13 +849,16 @@ def _gqa_sparse_fwd_kernel(
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
-        for _ in range(real_topk):
-            blk = tl.load(t_ptr_j).to(tl.int32)
-            t_ptr_j = t_ptr_j + stride_tk
-            c = blk * BLOCK_SIZE_K
-            page = tl.load(bt_row + blk).to(tl.int64)
+        for i_t in tl.range(0, BLOCK_SIZE_T):
+            blk = tl.load(t_ptr_j + i_t * stride_tk, mask=i_t < max_topk, other=-1).to(
+                tl.int32
+            )
+            valid_blk = blk >= 0
+            safe_blk = tl.maximum(blk, 0)
+            c = safe_blk * BLOCK_SIZE_K
+            page = tl.load(bt_row + safe_blk).to(tl.int64)
             pos = c + off_n
-            pos_mask = pos < seq_len
+            pos_mask = (pos < seq_len) & valid_blk
             k = tl.load(
                 k_cache_ptr
                 + page * stride_k_blk
@@ -917,7 +924,7 @@ def _gqa_sparse_fwd_kernel(
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
     }
 )
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit
 def _gqa_sparse_decode_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     k_cache_ptr,  # [num_blocks, 128, num_kv_heads, head_dim]
@@ -932,7 +939,7 @@ def _gqa_sparse_decode_kernel(
     head_dim,
     max_topk,
     sm_scale,
-    decode_query_len,
+    decode_query_len: tl.constexpr,
     stride_qn,
     stride_qh,
     stride_qd,
@@ -1367,7 +1374,10 @@ def minimax_m3_index_decode(
     )
 
     target_grid = 4096
-    max_num_kv_chunks = 256
+    # On Ascend, over-splitting the decode score pass is dominated by scalar
+    # scheduling and many empty programs. Keep a small split-K count and let
+    # each program score multiple 128-token blocks with q reused in UB.
+    max_num_kv_chunks = 8
     target = max(
         1,
         min(
@@ -1559,9 +1569,18 @@ def minimax_m3_sparse_attn_decode(
     # launch_pdl was specified but unrecognised"). Only pass it when PDL is
     # actually supported -- on ROCm use_pdl is always False, so it's omitted.
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
-    # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
-    TARGET_GRID = 256
-    target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
+    # split-K over the selected blocks; keep enough programs for small decode
+    # batches without paying for a 16-way partial merge on every token.
+    TARGET_GRID = 64
+    MAX_TOPK_CHUNKS = 4
+    target = max(
+        1,
+        min(
+            max_topk,
+            MAX_TOPK_CHUNKS,
+            TARGET_GRID // max(1, total_q * num_kv_heads),
+        ),
+    )
     num_topk_chunks = 1 << (target.bit_length() - 1)
     o_partial = torch.empty(
         num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
