@@ -824,21 +824,18 @@ def _gqa_sparse_fwd_kernel(
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
-        off_q_load = tl.arange(0, BLOCK_SIZE_Q)
-        off_h = tl.arange(0, BLOCK_SIZE_H)
-        q = tl.load(
-            q_ptr
-            + (q_start + pid_q_j * BLOCK_SIZE_Q + off_q_load[:, None, None])
-            * stride_qn
-            + (pid_h + off_h[None, :, None]) * stride_qh
-            + off_d[None, None, :] * stride_qd,
-            mask=(
-                (pid_q_j * BLOCK_SIZE_Q + off_q_load[:, None, None] < q_len)
-                & (off_h[None, :, None] < gqa_group_size)
-                & d_mask[None, None, :]
-            ),
-            other=0.0,
+        off_t = tl.arange(0, BLOCK_SIZE_T)
+        topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
+        real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            shape=(q_len, gqa_group_size, head_dim),
+            strides=(stride_qn, stride_qh, stride_qd),
+            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(2, 1, 0),
         )
+        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -849,16 +846,13 @@ def _gqa_sparse_fwd_kernel(
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
-        for i_t in tl.range(0, BLOCK_SIZE_T):
-            blk = tl.load(t_ptr_j + i_t * stride_tk, mask=i_t < max_topk, other=-1).to(
-                tl.int32
-            )
-            valid_blk = blk >= 0
-            safe_blk = tl.maximum(blk, 0)
-            c = safe_blk * BLOCK_SIZE_K
-            page = tl.load(bt_row + safe_blk).to(tl.int64)
+        for _ in range(real_topk):
+            blk = tl.load(t_ptr_j).to(tl.int32)
+            t_ptr_j = t_ptr_j + stride_tk
+            c = blk * BLOCK_SIZE_K
+            page = tl.load(bt_row + blk).to(tl.int64)
             pos = c + off_n
-            pos_mask = (pos < seq_len) & valid_blk
+            pos_mask = pos < seq_len
             k = tl.load(
                 k_cache_ptr
                 + page * stride_k_blk
