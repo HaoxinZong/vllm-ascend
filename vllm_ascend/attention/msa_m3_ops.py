@@ -139,16 +139,24 @@ def minimax_m3_index_score_torch(
     cu_seqlens_q_cpu = cu_seqlens_q.detach().cpu().tolist()
     seq_lens_cpu = seq_lens.detach().cpu().tolist()
     prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
-    block_table_cpu = block_table.detach().cpu().tolist()
     total_q, num_idx_heads, _ = idx_q.shape
     batch = len(cu_seqlens_q_cpu) - 1
     max_seq_len = max(seq_lens_cpu) if seq_lens_cpu else 0
-    max_block = math.ceil(max_seq_len / SPARSE_BLOCK_SIZE)
+    max_block = min(
+        block_table.shape[-1],
+        math.ceil(max_seq_len / SPARSE_BLOCK_SIZE),
+    )
     scores = torch.full(
         (num_idx_heads, total_q, max_block),
         float("-inf"),
         dtype=torch.float32,
         device=idx_q.device,
+    )
+    if max_block == 0:
+        return scores
+
+    block_offsets = torch.arange(
+        SPARSE_BLOCK_SIZE, dtype=torch.long, device=idx_q.device
     )
 
     for b in range(batch):
@@ -156,31 +164,54 @@ def minimax_m3_index_score_torch(
         q_end = cu_seqlens_q_cpu[b + 1]
         seq_len = seq_lens_cpu[b]
         prefix_len = prefix_lens_cpu[b]
-        bt_row = block_table_cpu[b]
-        for t in range(q_end - q_start):
-            q_abs = prefix_len + t
-            hi_blocks = min(
-                math.ceil(seq_len / SPARSE_BLOCK_SIZE),
-                math.ceil((q_abs + 1) / SPARSE_BLOCK_SIZE),
-            )
-            for h in range(num_idx_heads):
-                q_heads = idx_q[q_start + t]
-                per_head = torch.full(
-                    (hi_blocks,), float("-inf"), dtype=torch.float32, device=idx_q.device
-                )
-                for blk in range(hi_blocks):
-                    page = bt_row[blk]
-                    if page < 0:
-                        continue
-                    k_block = _get_index_block(cache, page)
-                    pos_end = min(
-                        SPARSE_BLOCK_SIZE, max(0, seq_len - blk * SPARSE_BLOCK_SIZE)
-                    )
-                    if pos_end <= 0:
-                        continue
-                    k_sel = k_block[:pos_end]
-                    per_head[blk] = (q_heads[h] * sm_scale * k_sel).sum(-1).max()
-                scores[h, q_start + t, :hi_blocks] = per_head
+        q_len = q_end - q_start
+        seq_blocks = min(
+            max_block,
+            math.ceil(seq_len / SPARSE_BLOCK_SIZE),
+            block_table.shape[-1],
+        )
+        if q_len <= 0 or seq_blocks <= 0:
+            continue
+
+        pages = block_table[b, :seq_blocks].long()
+        page_valid = pages >= 0
+        safe_pages = pages.clamp_min(0)
+        if cache.ndim == 3:
+            k_blocks = cache[safe_pages].float()
+        elif cache.ndim == 4:
+            k_blocks = cache[safe_pages, :, 0, :].float()
+        else:
+            raise ValueError(f"Unexpected index cache ndim: {cache.ndim}")
+
+        q = idx_q[q_start:q_end].permute(1, 0, 2).float() * sm_scale
+        k_flat = k_blocks.reshape(seq_blocks * SPARSE_BLOCK_SIZE, -1)
+        token_scores = torch.matmul(q, k_flat.transpose(0, 1))
+        token_scores = token_scores.view(
+            num_idx_heads, q_len, seq_blocks, SPARSE_BLOCK_SIZE
+        )
+
+        q_abs = prefix_len + torch.arange(q_len, dtype=torch.long, device=idx_q.device)
+        block_ids = torch.arange(seq_blocks, dtype=torch.long, device=idx_q.device)
+        visible_blocks = block_ids.view(1, seq_blocks) < torch.div(
+            q_abs.view(q_len, 1) + SPARSE_BLOCK_SIZE,
+            SPARSE_BLOCK_SIZE,
+            rounding_mode="floor",
+        )
+        token_positions = (
+            block_ids.view(seq_blocks, 1) * SPARSE_BLOCK_SIZE
+            + block_offsets.view(1, SPARSE_BLOCK_SIZE)
+        )
+        token_valid = token_positions < seq_len
+        valid = (
+            page_valid.view(1, seq_blocks, 1)
+            & visible_blocks.view(q_len, seq_blocks, 1)
+            & token_valid.view(1, seq_blocks, SPARSE_BLOCK_SIZE)
+        )
+        block_scores = token_scores.masked_fill(
+            ~valid.view(1, q_len, seq_blocks, SPARSE_BLOCK_SIZE),
+            float("-inf"),
+        ).max(dim=-1).values
+        scores[:, q_start:q_end, :seq_blocks] = block_scores
     return scores
 
 
@@ -195,24 +226,100 @@ def minimax_m3_index_topk_torch(
     local_blocks: int,
 ) -> torch.Tensor:
     log_indexer_used()
-    num_idx_heads, total_q, _ = score.shape
+    num_idx_heads, total_q, max_block = score.shape
     batch = cu_seqlens_q.shape[0] - 1
     cu_seqlens_q_cpu = cu_seqlens_q.detach().cpu().tolist()
     prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
     topk_idx = torch.full(
         (num_idx_heads, total_q, topk), -1, dtype=torch.int32, device=score.device
     )
+    if topk <= 0 or max_block <= 0:
+        return topk_idx
+
+    block_ids = torch.arange(max_block, dtype=torch.long, device=score.device)
+    topk_slots = torch.arange(topk, dtype=torch.long, device=score.device)
     for b in range(batch):
         q_start = cu_seqlens_q_cpu[b]
         q_end = cu_seqlens_q_cpu[b + 1]
         prefix_len = prefix_lens_cpu[b]
-        for t in range(q_end - q_start):
-            q_abs = prefix_len + t
-            hi_blocks = math.ceil((q_abs + 1) / SPARSE_BLOCK_SIZE)
-            for h in range(num_idx_heads):
-                topk_idx[h, q_start + t] = _topk_from_scores(
-                    score[h, q_start + t, :hi_blocks], topk, init_blocks, local_blocks
-                )
+        q_len = q_end - q_start
+        if q_len <= 0:
+            continue
+
+        q_abs = prefix_len + torch.arange(q_len, dtype=torch.long, device=score.device)
+        visible_counts = torch.clamp(
+            torch.div(q_abs + SPARSE_BLOCK_SIZE, SPARSE_BLOCK_SIZE, rounding_mode="floor"),
+            min=0,
+            max=max_block,
+        )
+        max_visible = min(
+            max_block,
+            math.ceil((prefix_len + q_len) / SPARSE_BLOCK_SIZE),
+        )
+
+        visible = topk_slots.view(1, topk) < visible_counts.view(q_len, 1)
+        request_idx = torch.where(
+            visible,
+            topk_slots.view(1, topk).expand(q_len, topk),
+            torch.full((q_len, topk), -1, dtype=torch.long, device=score.device),
+        ).to(torch.int32)
+        topk_idx[:, q_start:q_end, :] = request_idx.view(1, q_len, topk)
+
+        if max_visible <= topk:
+            continue
+
+        large_mask = visible_counts > topk
+        visible_blocks = block_ids.view(1, max_block) < visible_counts.view(q_len, 1)
+        forced_blocks = torch.zeros_like(visible_blocks)
+        if init_blocks > 0:
+            forced_blocks |= (block_ids.view(1, max_block) < init_blocks) & visible_blocks
+        if local_blocks > 0:
+            local_start = torch.clamp(visible_counts - local_blocks, min=0)
+            forced_blocks |= (
+                (block_ids.view(1, max_block) >= local_start.view(q_len, 1))
+                & visible_blocks
+            )
+
+        forced_rank = forced_blocks.long().cumsum(dim=-1) - 1
+        forced_slots = torch.arange(topk, dtype=torch.long, device=score.device)
+        forced_matches = forced_blocks[:, :, None] & (
+            forced_rank[:, :, None] == forced_slots.view(1, 1, topk)
+        )
+        forced_idx = (
+            forced_matches.long()
+            * (block_ids.view(1, max_block, 1) + 1)
+        ).max(dim=1).values - 1
+        forced_idx = forced_idx.to(torch.int32)
+        forced_count = torch.clamp(forced_blocks.sum(dim=-1), max=topk)
+        remaining = topk - forced_count
+
+        extra_score = score[:, q_start:q_end, :].float().masked_fill(
+            ~visible_blocks.view(1, q_len, max_block), float("-inf")
+        )
+        extra_score = extra_score.masked_fill(
+            forced_blocks.view(1, q_len, max_block), float("-inf")
+        )
+        _, extra_idx = torch.topk(extra_score, k=topk, dim=-1)
+        extra_slots = torch.arange(topk, dtype=torch.long, device=score.device)
+        dst_slots = forced_count.view(q_len, 1) + extra_slots.view(1, topk)
+        extra_valid = extra_slots.view(1, topk) < remaining.view(q_len, 1)
+        extra_matches = extra_valid[:, None, :] & (
+            forced_slots.view(1, topk, 1) == dst_slots[:, None, :]
+        )
+        extra_fill = (
+            extra_matches.view(1, q_len, topk, topk).long()
+            * (extra_idx.long().view(num_idx_heads, q_len, 1, topk) + 1)
+        ).max(dim=-1).values - 1
+        large_idx = torch.where(
+            extra_fill >= 0,
+            extra_fill.to(torch.int32),
+            forced_idx.view(1, q_len, topk),
+        )
+        topk_idx[:, q_start:q_end, :] = torch.where(
+            large_mask.view(1, q_len, 1),
+            large_idx,
+            topk_idx[:, q_start:q_end, :],
+        )
     return topk_idx
 
 
