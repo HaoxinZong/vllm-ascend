@@ -28,6 +28,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Any
 
+from vllm_ascend.minimax_m3_tensor_dump import (
+    dump_minimax_m3_tensor_point as dump_tensor_point,
+)
 import torch
 from torch import nn
 from transformers import BatchFeature, PretrainedConfig
@@ -36,6 +39,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -80,9 +84,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_ascend.minimax_m3_tensor_dump import (
-    dump_minimax_m3_tensor_point as dump_tensor_point,
-)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -124,7 +125,7 @@ def _is_minimax_m3_text_only() -> bool:
     if value:
         return value.lower() not in ("1", "true", "yes", "on")
     return False
-
+_DECODE_ITEMS = 0
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     cfg = getattr(config, "sparse_attention_config", None)
@@ -343,7 +344,7 @@ class MiniMaxM3Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.layer_name = f"{prefix}.attn"
-
+        self.layer_idx = int(prefix.split(sep=".")[-2])
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -423,24 +424,10 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        dump_tensor_point(
-            "m3_gqa_attention_input",
-            layer_name=self.layer_name,
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        # logger.error(f"[MiniMax Attention {self.layer_idx}] >>>>>>>>>>  attention input {hidden_states.to(torch.float).norm(p=1)}, shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
         qkv, _ = self.qkv_proj(hidden_states)
-        dump_tensor_point(
-            "m3_gqa_attention_qkv",
-            layer_name=self.layer_name,
-            qkv=qkv,
-        )
-        if (
-            qkv.device.type != "npu"
-            or qkv.dtype != torch.bfloat16
-            or positions.ndim != 1
-            or not getattr(self.rotary_emb, "is_neox_style", True)
-        ):
+        # logger.error(f"[MiniMax Attention {self.layer_idx}] >>>>>>>>>> attention  input  {qkv.to(torch.float).norm(p=1)}, shape is {qkv.shape}<<<<<<<<<<<<<<<<<<")
+        if  True:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
@@ -458,25 +445,16 @@ class MiniMaxM3Attention(nn.Module):
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
             )
-        dump_tensor_point(
-            "m3_gqa_attention_prepare_output",
-            layer_name=self.layer_name,
-            q=q,
-            k=k,
-            v=v,
-        )
+        # logger.error(f"[MiniMax Attention {self.layer_idx}] >>>>>>>>>> attention q  output  {q.to(torch.float).norm(p=1)}, shape is {q.shape}<<<<<<<<<<<<<<<<<<")
+        # logger.error(f"[MiniMax Attention {self.layer_idx}] >>>>>>>>>> attention k  output  {k.to(torch.float).norm(p=1)}, shape is {k.shape}<<<<<<<<<<<<<<<<<<")
+        # logger.error(f"[MiniMax Attention {self.layer_idx}] >>>>>>>>>> attention v  output  {v.to(torch.float).norm(p=1)}, shape is {v.shape}<<<<<<<<<<<<<<<<<<")
+        
         attn_output = self.attn(q, k, v)
-        dump_tensor_point(
-            "m3_gqa_attention_attn_output",
-            layer_name=self.layer_name,
-            attn_output=attn_output,
-        )
+        # if get_tensor_model_parallel_rank() == 0:
+        #     logger.error(f"[MiniMax GQA after self_attn {self.layer_idx}] >>>>>>>>>> attention  output  {attn_output.to(torch.float).norm(p=1)}, shape is {attn_output.shape}<<<<<<<<<<<<<<<<<<")
         output, _ = self.o_proj(attn_output)
-        dump_tensor_point(
-            "m3_gqa_attention_output",
-            layer_name=self.layer_name,
-            output=output,
-        )
+        # if get_tensor_model_parallel_rank() == 0:
+        #     logger.error(f"[MiniMax GQA after o_proj {self.layer_idx}] >>>>>>>>>> attention output  {output.to(torch.float).norm(p=1)}, shape is {output.shape}<<<<<<<<<<<<<<<<<<")
         return output
 
 
@@ -570,55 +548,44 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        dump_tensor_point(
-            "m3_decoder_layer_input",
-            layer_idx=self.layer_idx,
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
+        global _DECODE_ITEMS
         # Self Attention
+        # logger.error(f"[MiniMax Decode Layer {self.layer_idx}] >>>>>>>>>>  decode layer input {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        dump_tensor_point(
-            "m3_decoder_layer_after_input_norm",
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Decode Layer {self.layer_idx} Item {_DECODE_ITEMS}] >>>>>>>>>>  decode attention  after input_layernorm {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<< ")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        dump_tensor_point(
-            "m3_decoder_layer_attn_output",
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-        )
-
+        
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        dump_tensor_point(
-            "m3_decoder_layer_after_post_norm",
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Decode Layer {self.layer_idx} Item {_DECODE_ITEMS}] >>>>>>>>>>  decode attention after post_layernorm {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
 
+        if get_tensor_model_parallel_rank() == 0 and _DECODE_ITEMS == 3 and self.layer_idx == 59:
+                pt_name = f"/home/z00946994/scripts/dump_tensor/layer_{self.layer_idx}_iterm_{_DECODE_ITEMS}_rank_0_mlp_input.pt"
+                torch.save(hidden_states, pt_name)
         if self.is_layer_sparse:
             hidden_states = self.block_sparse_moe(hidden_states)
+            if get_tensor_model_parallel_rank() == 0:
+                logger.error(f"[MiniMax Decode Layer {self.layer_idx} Item {_DECODE_ITEMS}] >>>>>>>>>>  decode MOE {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
+            if get_tensor_model_parallel_rank() == 0 and _DECODE_ITEMS == 3 and self.layer_idx == 59:
+                pt_name = f"/home/z00946994/scripts/dump_tensor/layer_{self.layer_idx}_iterm_{_DECODE_ITEMS}_rank_0_moe_output.pt"
+                torch.save(hidden_states, pt_name)
         else:
             hidden_states = self.mlp(hidden_states)
-
-        dump_tensor_point(
-            "m3_decoder_layer_output",
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
+            if get_tensor_model_parallel_rank() == 0:
+                logger.error(f"[MiniMax Decode Layer {self.layer_idx} Item {_DECODE_ITEMS}] >>>>>>>>>>  decode MLP {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
+            if get_tensor_model_parallel_rank() == 0 and _DECODE_ITEMS == 3 and self.layer_idx == 1:
+                pt_name = f"/home/z00946994/scripts/dump_tensor/layer_{self.layer_idx}_iterm_{_DECODE_ITEMS}_rank_0_mlp_output.pt"
+                torch.save(hidden_states, pt_name)
+        # logger.error(f"[MiniMax Decode Layer {self.layer_idx}] >>>>>>>>>>  decode after ffn {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
         return hidden_states, residual
 
 
@@ -679,13 +646,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        dump_tensor_point(
-            "m3_model_input",
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            intermediate_tensors=intermediate_tensors,
-        )
+        global _DECODE_ITEMS
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Modeling Item {_DECODE_ITEMS}] >>>>>>>>>>  modeling input_ids {input_ids}<<<<<<<<<<<<<<<<<<")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -696,30 +659,14 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        dump_tensor_point(
-            "m3_model_embed_output",
-            hidden_states=hidden_states,
-            residual=residual,
-        )
-
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Modeling Item {_DECODE_ITEMS}] >>>>>>>>>>  modeling embedding output  {hidden_states.to(torch.float).norm(p=1)}, shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             layer_idx = self.start_layer + idx
-            dump_tensor_point(
-                "m3_model_layer_input",
-                layer_idx=layer_idx,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
             hidden_states, residual = layer(positions, hidden_states, residual)
-            dump_tensor_point(
-                "m3_model_layer_output",
-                layer_idx=layer_idx,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
@@ -729,15 +676,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        dump_tensor_point(
-            "m3_model_output",
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
-        )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
-
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Modeling Item {_DECODE_ITEMS}] >>>>>>>>>>  modeling  output  {hidden_states.to(torch.float).norm(p=1)}, shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<<")
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -984,25 +927,26 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        dump_tensor_point(
-            "m3_causal_lm_input",
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            kwargs=kwargs,
-        )
+        global _DECODE_ITEMS
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
-        dump_tensor_point("m3_causal_lm_output", hidden_states=hidden_states)
+        _DECODE_ITEMS += 1
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        global _DECODE_ITEMS
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Decode Layer Item {_DECODE_ITEMS}] >>>>>>>>>>  logits input {hidden_states.to(torch.float).norm(p=1)} , shape is {hidden_states.shape}<<<<<<<<<<<<<<<<<< ")
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"[MiniMax Decode Layer Item {_DECODE_ITEMS}] >>>>>>>>>>  logits output {logits.to(torch.float).norm(p=1)} , shape is {logits.shape}<<<<<<<<<<<<<<<<<< ")
+        if get_tensor_model_parallel_rank() == 0 and _DECODE_ITEMS == 3:
+                pt_name = f"/home/z00946994/scripts/dump_tensor/iterm_{_DECODE_ITEMS}_rank_0_logits_output.pt"
+                torch.save(logits, pt_name)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
