@@ -640,147 +640,179 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         num_tokens = main_md.num_actual_tokens
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
-        # out = output[:num_tokens].view(-1, self.num_heads, hd)
-
-        # if main_md.num_decodes > 0:
-        #     d = main_md.decode
-        #     assert d is not None and decode_topk is not None
-        #     minimax_m3_sparse_attn_decode(
-        #         q[:nd],
-        #         kv_cache,
-        #         decode_topk,
-        #         d.block_table,
-        #         d.seq_lens,
-        #         self.num_kv_heads,
-        #         self.scale,
-        #         out[:nd],
-        #         d.decode_query_len,
-        #     )
-
-        # if main_md.num_prefills > 0:
-        #     p = main_md.prefill
-        #     assert p is not None and prefill_topk is not None
-        #     minimax_m3_sparse_attn(
-        #         q[nd:],
-        #         kv_cache,
-        #         prefill_topk,
-        #         p.block_table,
-        #         p.cu_seqlens_q,
-        #         p.seq_lens,
-        #         p.context_lens,
-        #         p.max_query_len,
-        #         self.num_kv_heads,
-        #         self.scale,
-        #         out[nd:],
-        #     )
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-
-        dump_tensor_point(
-            "m3_sparse_impl_input",
-            layer_name=layer.layer_name,
-            query=query,
-            q=q,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            decode_topk=decode_topk,
-            prefill_topk=prefill_topk,
-            output_before=output[:num_tokens],
-            num_tokens=num_tokens,
-            num_decode_tokens=nd,
-        )
+        out = output[:num_tokens].view(-1, self.num_heads, hd)
 
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
-            decode_q_lens = torch.full(
-                (d.seq_lens.shape[0],),
-                d.decode_query_len,
-                dtype=torch.int64,
-                device=q.device,
-            )
-            decode_topk = decode_topk.contiguous()
-            dump_tensor_point(
-                "m3_sparse_op_decode_input",
-                layer_name=layer.layer_name,
-                query=q[:nd],
-                key_cache=key_cache,
-                value_cache=value_cache,
-                topk_idx=decode_topk,
-                block_table=d.block_table,
-                select_num_idx=_select_num_idx_from_topk(decode_topk),
-                actual_seq_lengths=decode_q_lens,
-                actual_seq_lengths_kv=d.seq_lens,
-            )
-            decode_out = torch.ops._C_ascend.npu_sparse_attention_score(
+            minimax_m3_sparse_attn_decode(
                 q[:nd],
-                key_cache,
-                value_cache,
+                kv_cache,
                 decode_topk,
-                d.block_table.contiguous(),
+                d.block_table,
+                d.seq_lens,
                 self.num_kv_heads,
                 self.scale,
-                self.block_size,
-                self.topk_blocks,
-                4,
-                select_num_idx=_select_num_idx_from_topk(decode_topk),
-                actual_seq_lengths=decode_q_lens,
-                actual_seq_lengths_kv=d.seq_lens.to(torch.int64).contiguous(),
-            )
-            output[:nd].view(-1, self.num_heads, hd).copy_(decode_out)
-            dump_tensor_point(
-                "m3_sparse_op_decode_output",
-                layer_name=layer.layer_name,
-                output=decode_out,
-                output_buffer=output[:nd],
+                out[:nd],
+                d.decode_query_len,
             )
 
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            prefill_q = q[nd:num_tokens]
-            prefill_q_lens = (p.cu_seqlens_q[1:] - p.cu_seqlens_q[:-1]).to(
-                torch.int64
-            )
-            prefill_topk = prefill_topk.contiguous()
-            dump_tensor_point(
-                "m3_sparse_op_prefill_input",
-                layer_name=layer.layer_name,
-                query=prefill_q,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                topk_idx=prefill_topk,
-                block_table=p.block_table,
-                select_num_idx=_select_num_idx_from_topk(prefill_topk),
-                actual_seq_lengths=prefill_q_lens,
-                actual_seq_lengths_kv=p.seq_lens,
-            )
-            prefill_out = torch.ops._C_ascend.npu_sparse_attention_score(
-                prefill_q,
-                key_cache,
-                value_cache,
+            minimax_m3_sparse_attn(
+                q[nd:],
+                kv_cache,
                 prefill_topk,
-                p.block_table.contiguous(),
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                p.context_lens,
+                p.max_query_len,
                 self.num_kv_heads,
                 self.scale,
-                self.block_size,
-                self.topk_blocks,
-                4,
-                select_num_idx=_select_num_idx_from_topk(prefill_topk),
-                actual_seq_lengths=prefill_q_lens.contiguous(),
-                actual_seq_lengths_kv=p.seq_lens.to(torch.int64).contiguous(),
+                out[nd:],
             )
-            output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
-            dump_tensor_point(
-                "m3_sparse_op_prefill_output",
-                layer_name=layer.layer_name,
-                output=prefill_out,
-                output_buffer=output[nd:num_tokens],
-            )
-        dump_tensor_point(
-            "m3_sparse_impl_output",
-            layer_name=layer.layer_name,
-            output=output[:num_tokens],
-        )
+            # if get_tensor_model_parallel_rank() == 0:
+            #     logger.error(f"[MSA_M3 Prefill] ========= prefill_q is {q[nd:].to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= key_cache is {kv_cache[0].to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= value_cache is {kv_cache[1].to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= topk_idx is {prefill_topk}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths is {p.cu_seqlens_q[1:].to(torch.int64)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths_kv is {p.seq_lens.to(torch.int64)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= prefill output is {out[nd:].to(torch.float).norm(p=1)}")
+
+        # 2 --------------------------------------------------------------------------------
+
+        # key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+        # if main_md.num_decodes > 0:
+        #     d = main_md.decode
+        #     assert d is not None and decode_topk is not None
+        #     actual_seq_lengths = torch.arange(
+        #         d.decode_query_len,
+        #         nd + 1,
+        #         d.decode_query_len,
+        #         dtype=torch.int64,
+        #         device=q.device,
+        #     )
+        #     decode_out = torch.ops._C_ascend.npu_sparse_attention_score(
+        #         q[:nd],
+        #         key_cache,
+        #         value_cache,
+        #         decode_topk,
+        #         d.block_table,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         self.block_size,
+        #         self.topk_blocks,
+        #         4,
+        #         actual_seq_lengths=actual_seq_lengths,
+        #         actual_seq_lengths_kv=d.seq_lens.to(torch.int64),
+        #     )
+        #     output[:nd].view(-1, self.num_heads, hd).copy_(decode_out)
+
+        # if main_md.num_prefills > 0:
+        #     p = main_md.prefill
+        #     assert p is not None and prefill_topk is not None
+        #     prefill_q = q[nd:num_tokens]
+        #     prefill_out = torch.ops._C_ascend.npu_sparse_attention_score(
+        #         prefill_q,
+        #         key_cache,
+        #         value_cache,
+        #         prefill_topk,
+        #         p.block_table,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         self.block_size,
+        #         self.topk_blocks,
+        #         4,
+        #         actual_seq_lengths=p.cu_seqlens_q[1:].to(torch.int64),
+        #         actual_seq_lengths_kv=p.seq_lens.to(torch.int64),
+        #     )
+            
+        #     output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
+        #     logger.error(f"[MSA_M3 Prefill] ========= prefill_q is {prefill_q.to(torch.float).norm(p=1)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= key_cache is {key_cache.to(torch.float).norm(p=1)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= value_cache is {value_cache.to(torch.float).norm(p=1)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= topk_idx is {prefill_topk}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths is {p.cu_seqlens_q[1:].to(torch.int64)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths full is {p.cu_seqlens_q.to(torch.int64)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths_kv is {p.seq_lens.to(torch.int64)}")
+        #     logger.error(f"[MSA_M3 Prefill] ========= prefill output is {output.to(torch.float).norm(p=1)}")
+
+
+        # 3 ----------------------------------------------------------------------------------
+        # key_cache, value_cache = kv_cache[0], kv_cache[1]
+        # if main_md.num_decodes > 0:
+        #     d = main_md.decode
+        #     assert d is not None and decode_topk is not None
+        #     # decode_q_lens = torch.full(
+        #     #     (d.seq_lens.shape[0],),
+        #     #     d.decode_query_len,
+        #     #     dtype=torch.int64,
+        #     #     device=q.device,
+        #     # )
+        #     decode_topk = decode_topk.contiguous()
+        #     # decode_select_num_idx = _select_num_idx_from_topk(decode_topk)
+        #     decode_out = torch.ops._C_ascend.npu_sparse_attention_score(
+        #         q[:nd],
+        #         key_cache,
+        #         value_cache,
+        #         decode_topk,
+        #         d.block_table,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         self.block_size,
+        #         self.topk_blocks,
+        #         4,
+        #         select_num_idx=None,
+        #         actual_seq_lengths=d.actual_seq_lengths,
+        #         actual_seq_lengths_kv=d.actual_seq_lengths_kv,
+        #     )
+        #     output[:nd].view(-1, self.num_heads, hd).copy_(decode_out)
+        #     # if get_tensor_model_parallel_rank() == 0:
+        #     #     logger.error(f"[MSA_M3 Decode] ========= decode_q is {q[:nd].to(torch.float).norm(p=1)}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= key_cache is {key_cache.to(torch.float).norm(p=1)}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= value_cache is {value_cache.to(torch.float).norm(p=1)}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= topk_idx is {decode_topk}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= actual_seq_lengths is {d.actual_seq_lengths}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= actual_seq_lengths_kv is {d.actual_seq_lengths_kv}")
+        #     #     logger.error(f"[MSA_M3 Decode] ========= decode output is {output[:nd].to(torch.float).norm(p=1)}")
+
+        # if main_md.num_prefills > 0:
+        #     p = main_md.prefill
+        #     assert p is not None and prefill_topk is not None
+        #     prefill_q = q[nd:num_tokens]
+        #     # prefill_q_lens = (p.cu_seqlens_q[1:] - p.cu_seqlens_q[:-1]).to(
+        #     #     torch.int64
+        #     # )
+        #     prefill_topk = prefill_topk.contiguous()
+        #     # prefill_select_num_idx = _select_num_idx_from_topk(prefill_topk)
+        #     prefill_out = torch.ops._C_ascend.npu_sparse_attention_score(
+        #         prefill_q,
+        #         key_cache,
+        #         value_cache,
+        #         prefill_topk,
+        #         p.block_table,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         self.block_size,
+        #         self.topk_blocks,
+        #         4,
+        #         select_num_idx=None,
+        #         actual_seq_lengths=p.actual_seq_lengths,
+        #         actual_seq_lengths_kv=p.actual_seq_lengths_kv,
+        #     )
+        #     output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
+            # if get_tensor_model_parallel_rank() == 0:
+            #     logger.error(f"[MSA_M3 Prefill] ========= prefill_q is {prefill_q.to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= key_cache is {key_cache.to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= value_cache is {value_cache.to(torch.float).norm(p=1)}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= topk_idx is {prefill_topk}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths is {p.actual_seq_lengths}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= actual_seq_lengths_kv is {p.actual_seq_lengths_kv}")
+            #     logger.error(f"[MSA_M3 Prefill] ========= prefill output is {output[nd:num_tokens].to(torch.float).norm(p=1)}")
         return output
 
 
