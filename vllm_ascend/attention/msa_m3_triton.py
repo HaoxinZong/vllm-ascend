@@ -288,6 +288,8 @@ def _index_block_score_kernel(
     for i in tl.range(0, hi, BLOCK_SIZE_K):
         blk = i // BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
+        valid_page = page >= 0
+        safe_page = tl.maximum(page, 0)
         pos = i + off_k
         # index-K for this page: [BLOCK_SIZE_D, BLOCK_SIZE_K] (transposed)
         # we don't need masked load for K, because KV cache ensures
@@ -295,16 +297,20 @@ def _index_block_score_kernel(
         # for tokens beyond seqlen, they will be masked in qk later.
         k = tl.load(
             ik_cache_ptr
-            + page * stride_ik_blk
+            + safe_page * stride_ik_blk
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
+            mask=valid_page,
+            other=0.0,
         )
         qk = tl.dot(q, k) * sm_scale_log2e
+        qk = tl.where(valid_page, qk, float("-inf"))
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
         # one sparse block per K-tile -> max over the 128 positions
         score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
+        score = tl.where(valid_page, score, -1e30)
         s_ptrs = (
             score_ptr
             + pid_h * stride_s_h
@@ -635,13 +641,17 @@ def _decode_index_score_kernel(
 
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
+        valid_page = page >= 0
+        safe_page = tl.maximum(page, 0)
         pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < kv_len
+        pos_mask = (pos < kv_len) & valid_page
         k = tl.load(
             ik_cache_ptr
-            + page * stride_ik_blk
+            + safe_page * stride_ik_blk
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
+            mask=valid_page,
+            other=0.0,
         )  # [N, D]
 
         kq = tl.dot(k, q) * sm_scale_log2e  # [N, H]
@@ -650,7 +660,8 @@ def _decode_index_score_kernel(
 
         is_init = blk < init_blocks
         is_local = (blk >= local_start) & (blk < num_blocks)
-        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        score = tl.where(valid_page, score, -1e30)
+        score = tl.where(is_local & valid_page, 1e29, tl.where(is_init & valid_page, 1e30, score))
         tl.store(
             score_ptr
             + tl.arange(0, num_idx_heads) * stride_s_h
@@ -850,11 +861,13 @@ def _gqa_sparse_fwd_kernel(
             t_ptr_j = t_ptr_j + stride_tk
             c = blk * BLOCK_SIZE_K
             page = tl.load(bt_row + blk).to(tl.int64)
+            valid_page = page >= 0
+            safe_page = tl.maximum(page, 0)
             pos = c + off_n
-            pos_mask = pos < seq_len
+            pos_mask = (pos < seq_len) & valid_page
             k = tl.load(
                 k_cache_ptr
-                + page * stride_k_blk
+                + safe_page * stride_k_blk
                 + off_n[None, :] * stride_k_pos
                 + pid_kh * stride_k_h
                 + off_d[:, None] * stride_k_d,
@@ -870,12 +883,15 @@ def _gqa_sparse_fwd_kernel(
             qk += tl.dot(q, k) * sm_scale_log2e
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            active_i = m_ij > float("-inf")
             p = tl.exp2(qk - m_ij[:, None])
+            p = tl.where(active_i[:, None], p, 0.0)
             l_ij = tl.sum(p, axis=1)
-            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+            acc_scale = tl.where(active_i, tl.exp2(m_i - m_ij), tl.zeros_like(m_i))
+            acc_o = acc_o * acc_scale[:, None]
             v = tl.load(
                 v_cache_ptr
-                + page * stride_v_blk
+                + safe_page * stride_v_blk
                 + off_n[:, None] * stride_v_pos
                 + pid_kh * stride_v_h
                 + off_d[None, :] * stride_v_d,
@@ -886,8 +902,14 @@ def _gqa_sparse_fwd_kernel(
                 v = v.to(q.dtype)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+            lse_next = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+            lse_i = tl.where(active_i, lse_next, lse_i)
+        has_lse = lse_i > float("-inf")
+        acc_o = tl.where(
+            has_lse[:, None],
+            acc_o * tl.exp2(m_i - lse_i)[:, None],
+            tl.zeros_like(acc_o),
+        )
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
         o_ptrs = tl.make_block_ptr(
             base=o_ptr + q_start * stride_on + pid_h * stride_oh,
@@ -927,6 +949,7 @@ def _gqa_sparse_decode_kernel(
     lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
+    max_blocks,
     total_q,
     gqa_group_size,
     head_dim,
@@ -1014,12 +1037,15 @@ def _gqa_sparse_decode_kernel(
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
+        valid_blk = (blk >= 0) & (blk < max_blocks)
+        page = tl.load(bt_row + blk, mask=valid_blk, other=-1).to(tl.int64)
+        valid_page = valid_blk & (page >= 0)
+        safe_page = tl.maximum(page, 0)
         pos = c + off_n
-        pos_mask = pos < kv_len
+        pos_mask = (pos < kv_len) & valid_page
         k = tl.load(
             k_cache_ptr
-            + page * stride_k_blk
+            + safe_page * stride_k_blk
             + off_n[None, :] * stride_k_pos
             + pid_kh * stride_k_h
             + off_d[:, None] * stride_k_d,
@@ -1032,12 +1058,15 @@ def _gqa_sparse_decode_kernel(
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        active_i = m_ij > float("-inf")
         p = tl.exp2(qk - m_ij[:, None])
+        p = tl.where(active_i[:, None], p, 0.0)
         l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+        acc_scale = tl.where(active_i, tl.exp2(m_i - m_ij), tl.zeros_like(m_i))
+        acc_o = acc_o * acc_scale[:, None]
         v = tl.load(
             v_cache_ptr
-            + page * stride_v_blk
+            + safe_page * stride_v_blk
             + off_n[:, None] * stride_v_pos
             + pid_kh * stride_v_h
             + off_d[None, :] * stride_v_d,
@@ -1048,7 +1077,8 @@ def _gqa_sparse_decode_kernel(
             v = v.to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        lse_next = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        lse_i = tl.where(active_i, lse_next, lse_i)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -1121,9 +1151,13 @@ def _merge_topk_attn_out_kernel(
     o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp2(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
-    o_merged = tl.sum(o * weights[:, None], axis=0)
+    has_lse = lse_max > float("-inf")
+    safe_lse_max = tl.where(has_lse, lse_max, 0.0)
+    weights = tl.where(lse > float("-inf"), tl.exp2(lse - safe_lse_max), 0.0)
+    denom = tl.sum(weights, axis=0)
+    denom_safe = tl.where(denom > 0.0, denom, 1.0)
+    o_merged = tl.sum(o * weights[:, None], axis=0) / denom_safe
+    o_merged = tl.where(has_lse, o_merged, tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32))
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     )
@@ -1579,6 +1613,7 @@ def minimax_m3_sparse_attn_decode(
         lse_partial,
         block_table,
         seq_lens,
+        block_table.shape[-1],
         total_q,
         gqa_group_size,
         head_dim,
