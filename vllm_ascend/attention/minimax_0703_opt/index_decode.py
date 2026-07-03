@@ -53,58 +53,6 @@ def _as_triton_index_kv_cache(
 
 
 @triton.jit
-def _select_topk_pairs(
-    scores,
-    indices,
-    valid_mask,
-    topk_size: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    off_k = tl.arange(0, block_size)
-    off_t = tl.arange(0, topk_size)
-
-    valid_i32 = valid_mask.to(tl.int32)
-    work_valid_i32 = valid_i32
-    work_scores = tl.where(work_valid_i32 != 0, scores, float("-inf"))
-    selected_scores = tl.full((topk_size,), -1e30, dtype=tl.float32)
-    selected_indices = tl.full((topk_size,), 0, dtype=tl.int32)
-
-    for rank in tl.static_range(0, topk_size):
-        best_score = tl.max(work_scores, axis=0)
-        best_offset = tl.argmax(work_scores, axis=0).to(tl.int32)
-
-        selected_i32 = (
-            (off_k == best_offset).to(tl.int32) * work_valid_i32
-        )
-        best_index = tl.sum(
-            tl.where(selected_i32 != 0, indices, 0),
-            axis=0,
-        ).to(tl.int32)
-        has_best_i32 = (best_index > 0).to(tl.int32)
-
-        selected_scores = tl.where(
-            off_t == rank,
-            tl.where(has_best_i32 != 0, best_score, -1e30),
-            selected_scores,
-        )
-        selected_indices = tl.where(
-            off_t == rank,
-            tl.where(has_best_i32 != 0, best_index, 0),
-            selected_indices,
-        )
-
-        selected_lane_i32 = (off_k == best_offset).to(tl.int32)
-        work_valid_i32 = work_valid_i32 * (1 - selected_lane_i32)
-        work_scores = tl.where(
-            selected_lane_i32 != 0,
-            float("-inf"),
-            work_scores,
-        )
-
-    return selected_scores, selected_indices
-
-
-@triton.jit
 def _merge_topk_pairs(
     left_scores,
     left_indices,
@@ -247,10 +195,14 @@ def _decode_fused_chunk_topk_kernel(
     topk_scores = tl.full((num_idx_heads, TOPK_WIDTH), -1e30, dtype=tl.float32)
     topk_indices = tl.full((num_idx_heads, TOPK_WIDTH), -1, dtype=tl.int32)
 
-    for blk in tl.range(chunk_start, chunk_end):
+    # Process all but the last block without position masking.
+    # Only the last block in a chunk may have partial positions;
+    # skipping the mask for the other (chunk_blocks-1)/chunk_blocks
+    # iterations eliminates the per-block position computation, the
+    # elementwise mask comparison, and the tl.where broadcast for
+    # the common fully-valid case.
+    for blk in tl.range(chunk_start, chunk_end - 1):
         page = tl.load(bt_row + blk).to(tl.int64)
-        pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < kv_len
         k = tl.load(
             ik_cache_ptr
             + page * stride_ik_blk
@@ -259,7 +211,6 @@ def _decode_fused_chunk_topk_kernel(
         )  # [N, D]
 
         kq = tl.dot(k, q) * sm_scale_log2e  # [N, H]
-        kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
 
         is_init = blk < init_blocks
@@ -278,6 +229,39 @@ def _decode_fused_chunk_topk_kernel(
         block_idx = (blk + 1).to(tl.int32)
         topk_scores = tl.where(replace_mask, score[:, None], topk_scores)
         topk_indices = tl.where(replace_mask, block_idx, topk_indices)
+
+    # Process the last block with position mask (may have partial tail).
+    blk = chunk_end - 1
+    page = tl.load(bt_row + blk).to(tl.int64)
+    pos = blk * BLOCK_SIZE_K + off_k
+    pos_mask = pos < kv_len
+    k = tl.load(
+        ik_cache_ptr
+        + page * stride_ik_blk
+        + off_k[:, None] * stride_ik_pos
+        + off_d * stride_ik_d,
+    )  # [N, D]
+
+    kq = tl.dot(k, q) * sm_scale_log2e  # [N, H]
+    kq = tl.where(pos_mask[:, None], kq, float("-inf"))
+    score = tl.max(kq, axis=0)  # [H]
+
+    is_init = blk < init_blocks
+    is_local = (blk >= local_start) & (blk < num_blocks)
+    score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+
+    # Running top-k per head: [H, TOPK_WIDTH]
+    min_score = tl.min(topk_scores, axis=1)  # [H]
+    min_pos = tl.argmin(topk_scores, axis=1)  # [H]
+
+    should_replace = (score > min_score)  # [H]
+    replace_mask = (
+        (off_t[None, :] == min_pos[:, None]) & should_replace[:, None]
+    )
+
+    block_idx = (blk + 1).to(tl.int32)
+    topk_scores = tl.where(replace_mask, score[:, None], topk_scores)
+    topk_indices = tl.where(replace_mask, block_idx, topk_indices)
 
     # Store partial top-k scores and indices per head.
     off_h = tl.arange(0, num_idx_heads)
@@ -413,178 +397,6 @@ def _decode_fused_score_topk_kernel(
         output_vals,
     )
 
-
-# ---------------------------------------------------------------------------
-# Decode index-score kernel (split-K over seq blocks). Decode batches are
-# flattened request-major, with a runtime query length used to map each query
-# token back to its request metadata. Base-2 score scaling matches prefill.
-# ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["num_kv_chunks", "decode_query_len"])
-def _decode_index_score_kernel(
-    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
-    score_ptr,  # [num_idx_heads, total_q, max_block]
-    block_table_ptr,  # [num_reqs, max_blocks]
-    seq_lens,  # [num_reqs]
-    num_idx_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    init_blocks,
-    local_blocks,
-    sm_scale,
-    decode_query_len,
-    stride_q_n,
-    stride_q_h,
-    stride_q_d,
-    stride_ik_blk,
-    stride_ik_pos,
-    stride_ik_d,
-    stride_s_h,
-    stride_s_n,
-    stride_s_k,
-    stride_bt_b,
-    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    num_kv_chunks,
-):
-    sm_scale_log2e = sm_scale * 1.4426950409
-    pid_b = tl.program_id(0)  # flattened query-token id
-    pid_c = tl.program_id(1)
-    req_id = pid_b // decode_query_len
-    q_offset = pid_b - req_id * decode_query_len
-
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
-    # Full-shape padding uses zero-length request rows. Clamp to an empty
-    # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
-    num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-
-    # Block-aligned fixed-count split.  The grid depends only on the launch
-    # shape, while each program masks to its request's actual valid block range.
-    chunk_size_blocks = (num_blocks + num_kv_chunks - 1) // num_kv_chunks
-    chunk_start_block = pid_c * chunk_size_blocks
-    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
-    if chunk_start_block >= chunk_end_block:
-        return
-
-    off_k = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, head_dim)
-    bt_row = block_table_ptr + req_id * stride_bt_b
-    local_start = tl.maximum(0, num_blocks - local_blocks)
-
-    q = tl.load(
-        q_ptr
-        + pid_b * stride_q_n
-        + tl.arange(0, num_idx_heads) * stride_q_h
-        + off_d[:, None] * stride_q_d,
-    )  # [D, H]
-
-    for blk in tl.range(chunk_start_block, chunk_end_block):
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < kv_len
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d * stride_ik_d,
-        )  # [N, D]
-
-        kq = tl.dot(k, q) * sm_scale_log2e  # [N, H]
-        kq = tl.where(pos_mask[:, None], kq, float("-inf"))
-        score = tl.max(kq, axis=0)  # [H]
-
-        is_init = blk < init_blocks
-        is_local = (blk >= local_start) & (blk < num_blocks)
-        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
-        tl.store(
-            score_ptr
-            + tl.arange(0, num_idx_heads) * stride_s_h
-            + pid_b * stride_s_n
-            + blk * stride_s_k,
-            score,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Decode local top-k: one program per (query-token, head, chunk).
-# ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["chunk_blocks", "decode_query_len"])
-def _decode_topk_partial_kernel(
-    s_ptr,
-    scores_partial_ptr,
-    indices_partial_ptr,
-    seq_lens,
-    chunk_blocks,
-    decode_query_len,
-    stride_s_h,
-    stride_s_n,
-    stride_s_k,
-    stride_ps_c,
-    stride_ps_h,
-    stride_ps_n,
-    stride_ps_t,
-    stride_pi_c,
-    stride_pi_h,
-    stride_pi_n,
-    stride_pi_t,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_T: tl.constexpr,
-    BLOCK_SIZE_BLOCK: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_chunk = tl.program_id(2)
-
-    req_id = pid_n // decode_query_len
-    q_offset = pid_n - req_id * decode_query_len
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
-    kv_len = tl.maximum(query_pos + 1, 0)
-    num_blocks = (kv_len + BLOCK_SIZE_BLOCK - 1) // BLOCK_SIZE_BLOCK
-
-    off_k = tl.arange(0, BLOCK_SIZE_K)
-    off_t = tl.arange(0, BLOCK_SIZE_T)
-    chunk_start = pid_chunk * chunk_blocks
-    block_ids = chunk_start + off_k
-    valid_i32 = (
-        ((block_ids < num_blocks) & (off_k < chunk_blocks)).to(tl.int32)
-    )
-
-    scores = tl.load(
-        s_ptr
-        + pid_h * stride_s_h
-        + pid_n * stride_s_n
-        + block_ids * stride_s_k,
-        mask=valid_i32 != 0,
-        other=-1e30,
-    ).to(tl.float32)
-    scores = tl.where(scores != scores, -1e30, scores)
-    indices = tl.where(valid_i32 != 0, block_ids + 1, 0).to(tl.int32)
-
-    selected_scores, selected_indices = _select_topk_pairs(
-        scores,
-        indices,
-        valid_i32 != 0,
-        BLOCK_SIZE_T,
-        BLOCK_SIZE_K,
-    )
-
-    tl.store(
-        scores_partial_ptr
-        + pid_chunk * stride_ps_c
-        + pid_h * stride_ps_h
-        + pid_n * stride_ps_n
-        + off_t * stride_ps_t,
-        selected_scores,
-    )
-    tl.store(
-        indices_partial_ptr
-        + pid_chunk * stride_pi_c
-        + pid_h * stride_pi_h
-        + pid_n * stride_pi_n
-        + off_t * stride_pi_t,
-        selected_indices,
-    )
 
 
 @triton.jit(do_not_specialize=["num_input_chunks"])
@@ -846,6 +658,7 @@ def minimax_m3_index_decode(
             stride_out_t=topk_idx.stride(2),
             stride_bt_b=block_table.stride(0),
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_stages=TOPK_NUM_STAGES,
         )
         return topk_idx
 
@@ -853,21 +666,24 @@ def minimax_m3_index_decode(
     # Each program processes one chunk of blocks, maintaining a partial
     # running topk per head. Partial results are then merged using the
     # existing topk merge pipeline.
-    chunk_blocks = triton.cdiv(score_block_stride, num_chunks)
+    # Use finer chunking than the old select_width would give (x2 chunks)
+    # to reduce per-program iteration count and improve parallelism.
+    num_fused_chunks = min(num_chunks * 2, 32)
+    chunk_blocks = triton.cdiv(score_block_stride, num_fused_chunks)
 
     partial_scores = torch.full(
-        (num_chunks, num_idx_heads, total_q, topk_width),
+        (num_fused_chunks, num_idx_heads, total_q, topk_width),
         float("-inf"),
         dtype=torch.float32,
         device=idx_q.device,
     )
     partial_indices = torch.full(
-        (num_chunks, num_idx_heads, total_q, topk_width),
+        (num_fused_chunks, num_idx_heads, total_q, topk_width),
         -1,
         dtype=torch.int32,
         device=idx_q.device,
     )
-    _decode_fused_chunk_topk_kernel[(total_q, num_chunks)](
+    _decode_fused_chunk_topk_kernel[(total_q, num_fused_chunks)](
         idx_q,
         index_kv_cache,
         partial_scores,
@@ -899,6 +715,7 @@ def minimax_m3_index_decode(
         stride_bt_b=block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_BLOCK=SPARSE_BLOCK_SIZE,
+        num_stages=TOPK_NUM_STAGES,
     )
 
     _, final_indices = _merge_topk_levels(
