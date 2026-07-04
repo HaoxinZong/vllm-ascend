@@ -1212,10 +1212,19 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         idx_cache = self.indexer.index_cache.kv_cache
         if isinstance(idx_cache, (tuple, list)):
-            idx_cache = idx_cache[0]
-        flat = idx_cache.view(-1, self.idx_head_dim)
-        flat[index_meta.slot_mapping[:num_tokens]] = index_key[:num_tokens].to(
-            flat.dtype
+            if len(idx_cache) >= 2:
+                idx_key_cache, idx_value_cache = idx_cache[0], idx_cache[1]
+            else:
+                idx_key_cache, idx_value_cache = idx_cache[0][0], idx_cache[0][1]
+        else:
+            idx_key_cache, idx_value_cache = idx_cache[0], idx_cache[1]
+        idx_insert = index_key[:num_tokens].view(-1, 1, self.idx_head_dim)
+        DeviceOperator.reshape_and_cache(
+            idx_insert,
+            idx_insert,
+            idx_key_cache,
+            idx_value_cache,
+            index_meta.slot_mapping[:num_tokens],
         )
 
     def _sparse_prepare(
