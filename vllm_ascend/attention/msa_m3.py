@@ -61,6 +61,17 @@ logger = init_logger(__name__)
 _SPARSE_ATTN_LOGGED = False
 
 
+def _active_decode_num_reqs(
+    num_decodes: int,
+    num_decode_tokens: int,
+    decode_query_len: int,
+) -> int:
+    """Return the number of real decode requests, ignoring FIA/graph padding."""
+    if decode_query_len <= 0:
+        return 0
+    return min(num_decodes, num_decode_tokens // decode_query_len)
+
+
 class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -239,13 +250,17 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             )
 
         decode_metadata: AscendMiniMaxM3IndexerDecodeMetadata | None = None
+        active_decodes = 0
         if num_decodes > 0:
             qsl_cpu = common_attn_metadata.query_start_loc_cpu
             query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
             decode_query_len = int(query_lens_cpu[0].item())
+            active_decodes = _active_decode_num_reqs(
+                num_decodes, num_decode_tokens, decode_query_len
+            )
             decode_metadata = AscendMiniMaxM3IndexerDecodeMetadata(
-                seq_lens=seq_lens[:num_decodes],
-                block_table=block_table[:num_decodes],
+                seq_lens=seq_lens[:active_decodes],
+                block_table=block_table[:active_decodes],
                 max_seq_len=common_attn_metadata.max_seq_len,
                 decode_query_len=decode_query_len,
             )
@@ -255,7 +270,7 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
             num_actual_tokens=num_tokens,
-            num_decodes=num_decodes,
+            num_decodes=active_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -548,13 +563,17 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             )
 
         decode_metadata: AscendMiniMaxM3SparseDecodeMetadata | None = None
+        active_decodes = 0
         if num_decodes > 0:
             qsl_cpu = common_attn_metadata.query_start_loc_cpu
             query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
             decode_query_len = int(query_lens_cpu[0].item())
+            active_decodes = _active_decode_num_reqs(
+                num_decodes, num_decode_tokens, decode_query_len
+            )
             decode_metadata = AscendMiniMaxM3SparseDecodeMetadata(
-                seq_lens=seq_lens[:num_decodes],
-                block_table=block_table[:num_decodes],
+                seq_lens=seq_lens[:active_decodes],
+                block_table=block_table[:active_decodes],
                 max_seq_len=common_attn_metadata.max_seq_len,
                 decode_query_len=decode_query_len,
             )
@@ -564,7 +583,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
             num_actual_tokens=num_tokens,
-            num_decodes=num_decodes,
+            num_decodes=active_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
