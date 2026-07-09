@@ -20,6 +20,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     adjust_block_scale_shard,
 )
+from vllm_ascend.attention.msa_m3_npu import (
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc,
+    minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_ascendc
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.parameter import BasevLLMParameter, BlockQuantScaleParameter
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -702,13 +706,13 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         #         self.scale,
         #         out[nd:],
         #     )
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
 
+        # ascend c impl v1
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
             decode_topk = decode_topk.contiguous()
-            decode_select_num_idx = _select_num_idx_from_topk(decode_topk)
             decode_out = torch.ops._C_ascend.npu_sparse_attention_score(
                 q[:nd],
                 key_cache,
@@ -720,7 +724,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.block_size,
                 self.topk_blocks,
                 4,
-                select_num_idx=decode_select_num_idx,
+                select_num_idx=None,
                 actual_seq_lengths=d.actual_seq_lengths,
                 actual_seq_lengths_kv=d.actual_seq_lengths_kv,
             )
@@ -731,7 +735,6 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
             assert p is not None and prefill_topk is not None
             prefill_q = q[nd:num_tokens]
             prefill_topk = prefill_topk.contiguous()
-            prefill_select_num_idx = _select_num_idx_from_topk(prefill_topk)
             prefill_out = torch.ops._C_ascend.npu_sparse_attention_score(
                 prefill_q,
                 key_cache,
@@ -743,12 +746,46 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.block_size,
                 self.topk_blocks,
                 4,
-                select_num_idx=prefill_select_num_idx,
+                select_num_idx=None,
                 actual_seq_lengths=p.actual_seq_lengths,
                 actual_seq_lengths_kv=p.actual_seq_lengths_kv,
             )
             output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
-        return output
+            
+        # ascend c impl v2
+        # if main_md.num_decodes > 0:
+        #     d = main_md.decode
+        #     assert d is not None and decode_topk is not None
+        #     minimax_m3_sparse_attn_decode_ascendc(
+        #         q[:nd],
+        #         kv_cache,
+        #         decode_topk,
+        #         d.block_table,
+        #         d.seq_lens,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         out[:nd],
+        #         d.decode_query_len,
+        #         block_size=self.block_size,
+        #     )
+
+        # if main_md.num_prefills > 0:
+        #     p = main_md.prefill
+        #     assert p is not None and prefill_topk is not None
+        #     minimax_m3_sparse_attn_ascendc(
+        #         q[nd:],
+        #         kv_cache,
+        #         prefill_topk,
+        #         p.block_table,
+        #         p.cu_seqlens_q,
+        #         p.seq_lens,
+        #         p.context_lens,
+        #         p.max_query_len,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         out[nd:],
+        #         block_size=self.block_size,
+        #     )
 
 
 class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
