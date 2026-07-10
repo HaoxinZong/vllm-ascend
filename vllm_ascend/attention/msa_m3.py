@@ -121,6 +121,27 @@ def _align_seq_lens_block_table_for_fia(
     return seq_lens, block_table
 
 
+def _compute_context_lens_aligned(
+    seq_lens: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    context_len_buffer: torch.Tensor,
+) -> torch.Tensor:
+    """Compute context_lens from aligned seq_lens and query_start_loc slices."""
+    num_reqs = seq_lens.shape[0]
+    query_lens_cpu = (
+        query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]
+    )
+    context_lens_cpu = seq_lens[:num_reqs].detach().cpu() - query_lens_cpu
+    context_lens = context_len_buffer[:num_reqs]
+    context_lens.copy_(
+        context_lens_cpu.to(
+            device=context_len_buffer.device, dtype=torch.int32, non_blocking=True
+        ),
+        non_blocking=True,
+    )
+    return context_lens
+
+
 class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -284,9 +305,10 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             )
         )
 
-        context_lens = self.context_len_buffer[: seq_lens.shape[0]]
-        context_lens.copy_(
-            common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
+        context_lens = _compute_context_lens_aligned(
+            seq_lens,
+            qsl_cpu,
+            self.context_len_buffer,
         )
 
         prefill_metadata: AscendMiniMaxM3IndexerPrefillMetadata | None = None
@@ -600,9 +622,10 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             )
         )
 
-        context_lens = self.context_len_buffer[: seq_lens.shape[0]]
-        context_lens.copy_(
-            common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
+        context_lens = _compute_context_lens_aligned(
+            seq_lens,
+            qsl_cpu,
+            self.context_len_buffer,
         )
 
         prefill_metadata: AscendMiniMaxM3SparsePrefillMetadata | None = None
