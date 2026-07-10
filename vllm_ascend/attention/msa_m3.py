@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    MLAAttentionSpec,
     get_kv_quant_mode,
 )
 from vllm_ascend.attention.msa_m3_triton import (
@@ -102,7 +103,8 @@ class AscendMiniMaxM3IndexerBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        assert num_kv_heads == 1
+        return (num_blocks, block_size, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
@@ -110,7 +112,7 @@ class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if include_num_layers_dimension:
             raise NotImplementedError
-        return (0, 1, 2, 3, 4)
+        return (0, 1, 2)
 
 
 class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
@@ -132,11 +134,10 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return FullAttentionSpec(
+        return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            head_size_v=self.head_dim,
             dtype=self.dtype,
         )
 
@@ -1196,26 +1197,32 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         assert isinstance(main_meta, AscendMiniMaxM3SparseMetadata)
         assert isinstance(index_meta, AscendMiniMaxM3IndexerMetadata)
 
-        from vllm_ascend.device.device_op import DeviceOperator
+        import torch_npu
 
         key_cache, value_cache = self.kv_cache
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        DeviceOperator.reshape_and_cache(
-            k_insert,
-            v_insert,
-            key_cache,
-            value_cache,
-            main_meta.slot_mapping[:num_tokens],
+        slot_mapping = main_meta.slot_mapping[:num_tokens].view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            key_cache.view(-1, self.num_kv_heads, self.head_dim),
+            slot_mapping,
+            k_insert.to(key_cache.dtype),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            value_cache.view(-1, self.num_kv_heads, self.head_dim),
+            slot_mapping,
+            v_insert.to(value_cache.dtype),
         )
 
         idx_cache = self.indexer.index_cache.kv_cache
         if isinstance(idx_cache, (tuple, list)):
             idx_cache = idx_cache[0]
         flat = idx_cache.view(-1, self.idx_head_dim)
-        flat[index_meta.slot_mapping[:num_tokens]] = index_key[:num_tokens].to(
-            flat.dtype
+        torch_npu.npu_scatter_nd_update_(
+            flat,
+            index_meta.slot_mapping[:num_tokens].view(-1, 1),
+            index_key[:num_tokens].to(flat.dtype),
         )
 
     def _sparse_prepare(

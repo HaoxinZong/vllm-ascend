@@ -40,6 +40,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.msa_m3 import AscendMiniMaxM3IndexerCache, MiniMaxM3SparseAttention
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -58,6 +59,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             continue
         if isinstance(attn_module, Attention):
+            if spec := attn_module.get_kv_cache_spec(vllm_config):
+                kv_cache_spec[layer_name] = spec
+            continue
+        if isinstance(attn_module, (MiniMaxM3SparseAttention, AscendMiniMaxM3IndexerCache)):
             if spec := attn_module.get_kv_cache_spec(vllm_config):
                 kv_cache_spec[layer_name] = spec
             continue
@@ -247,6 +252,10 @@ def _get_attention_kv_cache_dims(layer_name: str, kv_cache_spec: AttentionSpec) 
     return kv_cache_spec.head_size, head_size_v
 
 
+def _is_minimax_m3_index_cache(layer_name: str, kv_cache_spec: KVCacheSpec) -> bool:
+    return layer_name.endswith(".index_cache") and isinstance(kv_cache_spec, MLAAttentionSpec)
+
+
 def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     data_ptr = tensor.data_ptr()
     aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
@@ -276,7 +285,7 @@ def _allocate_kv_cache(
     vllm_config = get_current_vllm_config()
 
     # init kv cache tensors
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
@@ -293,6 +302,16 @@ def _allocate_kv_cache(
         example_layer_name = kv_cache_tensor.shared_by[0]
         example_kv_cache_spec = layer_kv_cache_spec[example_layer_name]
         assert isinstance(example_kv_cache_spec, AttentionSpec)
+
+        if _is_minimax_m3_index_cache(example_layer_name, example_kv_cache_spec):
+            if vllm_config.kv_transfer_config is None:
+                tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            else:
+                tensor = torch.zeros(kv_cache_tensor.size + alignment, dtype=torch.int8, device=device)
+                tensor = _align_memory(tensor, alignment)[: kv_cache_tensor.size]
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_raw_tensors[layer_name] = tensor
+            continue
 
         k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_kv_cache_spec)
         assert k_dim > 0 and v_dim > 0
@@ -330,7 +349,7 @@ def _allocate_kv_cache(
 
 def _reshape_kv_cache(
     kv_cache_config: KVCacheConfig,
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
     attn_backends: dict[str, AttentionBackend],
     cache_dtype: str,
     kernel_block_sizes: list[int] | None = None,
@@ -361,6 +380,31 @@ def _reshape_kv_cache(
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             if isinstance(kv_cache_spec, AttentionSpec):
+                if _is_minimax_m3_index_cache(layer_name, kv_cache_spec):
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert isinstance(raw_tensor, torch.Tensor)
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    assert num_blocks >= kv_cache_config.num_blocks
+
+                    attn_backend = attn_backends[layer_name]
+                    if kv_cache_group_id < len(kernel_block_sizes):
+                        kernel_block_size = kernel_block_sizes[kv_cache_group_id]
+                        num_blocks *= kv_cache_spec.block_size // kernel_block_size
+                    else:
+                        kernel_block_size = kv_cache_spec.block_size
+
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype,
+                    )
+                    kv_caches[layer_name] = raw_tensor.view(kv_cache_spec.dtype).view(kv_cache_shape)
+                    continue
+
+                assert isinstance(kv_cache_raw_tensors[layer_name], tuple)
                 raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
                 assert raw_k_tensor is not None
                 assert raw_v_tensor is not None
@@ -430,7 +474,7 @@ def _reshape_kv_cache(
 
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
@@ -457,6 +501,25 @@ def _reshape_kv_cache_v2(
 
             assert isinstance(kv_cache_spec, AttentionSpec)
 
+            if _is_minimax_m3_index_cache(layer_name, kv_cache_spec):
+                raw_tensor = kv_cache_raw_tensors[layer_name]
+                assert isinstance(raw_tensor, torch.Tensor)
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+                kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+
+                kv_cache_shape = group.backend.get_kv_cache_shape(
+                    kernel_num_blocks,
+                    kernel_block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype,
+                )
+                kv_caches[layer_name] = raw_tensor.view(kv_cache_spec.dtype).view(kv_cache_shape)
+                continue
+
+            assert isinstance(kv_cache_raw_tensors[layer_name], tuple)
             raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_k_tensor is not None
             assert raw_v_tensor is not None
