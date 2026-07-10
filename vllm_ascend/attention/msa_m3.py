@@ -49,7 +49,7 @@ from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_sparse_attn_decode
 )
 
-from vllm_ascend.attention.m3_indexer import (
+from vllm_ascend.attention.m3_indexer.m3_indexer_triton import (
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
