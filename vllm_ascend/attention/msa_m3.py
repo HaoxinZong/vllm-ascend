@@ -43,14 +43,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
-from vllm_ascend.attention.msa_m3_npu import (
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
-)
+from vllm_ascend.attention.msa_m3_npu import minimax_m3_sparse_attn
 from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
+    minimax_m3_sparse_attn_decode,
 )
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
@@ -627,7 +625,6 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.scale,
                 out[:nd],
                 d.decode_query_len,
-                block_size=self.block_size,
             )
 
         if main_md.num_prefills > 0:
