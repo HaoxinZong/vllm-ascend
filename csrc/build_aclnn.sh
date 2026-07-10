@@ -220,6 +220,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
         "sparse_attention_score"
+        "store_kv_block"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
