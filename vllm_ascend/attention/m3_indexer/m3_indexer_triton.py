@@ -36,6 +36,25 @@ TOPK_NUM_WARPS = 4
 TOPK_NUM_STAGES = 2
 
 
+def _as_triton_index_kv_cache(
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize Ascend indexer cache to [num_blocks, 128, head_dim]."""
+    if isinstance(index_kv_cache, (tuple, list)):
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 5 and index_kv_cache.shape[0] == 2:
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 4:
+        if index_kv_cache.shape[2] != 1:
+            raise ValueError(
+                f"Unexpected index cache head dim: {tuple(index_kv_cache.shape)}"
+            )
+        index_kv_cache = index_kv_cache.squeeze(2)
+    if index_kv_cache.ndim != 3:
+        raise ValueError(f"Unexpected index cache ndim: {index_kv_cache.ndim}")
+    return index_kv_cache
+
+
 @triton.jit
 def _select_topk_pairs(
     scores,
@@ -1273,7 +1292,7 @@ def _prefill_score_q_tile(max_query_len: int) -> int:
 @torch.no_grad()
 def minimax_m3_index_score(
     idx_q: torch.Tensor,
-    index_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     block_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1283,6 +1302,7 @@ def minimax_m3_index_score(
     num_kv_heads: int,
     sm_scale: float,
 ) -> torch.Tensor:
+    index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads
 
@@ -1456,7 +1476,7 @@ def minimax_m3_index_topk(
 @torch.no_grad()
 def minimax_m3_index_decode(
     idx_q: torch.Tensor,
-    index_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -1473,6 +1493,7 @@ def minimax_m3_index_decode(
     writes only its local top-k pairs.  The existing pairwise merge tree then
     combines those sorted runs.
     """
+    index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads
     assert total_q == seq_lens.shape[0] * decode_query_len
