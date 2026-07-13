@@ -691,7 +691,8 @@ def _get_column_parallel_op(
         if any(p in prefix for p in ("qkv_proj", "conv1d", "query_key_value")):
             return Flashcomm2OshardQKVParallelOp(layer)
     if enable_sp() and not _is_multimodal_encoder_prefix(prefix):
-        if "shared_expert" in prefix:
+        # "share_expert" added for Step3p5
+        if "shared_expert" in prefix or "share_expert" in prefix:
             return None
         sp_column_prefix = [
             "gate_up_proj",  # first MLP of most LLMs
@@ -700,9 +701,10 @@ def _get_column_parallel_op(
             "conv1d",  # gated deltanet of Qwen3 Next
             "query_key_value",  # qkv linear of Bailing
             "indexer_proj",  # indexer linear of M3
+            "g_proj",  # attention gate projection of Step3p5
         ]
         for a_prefix in sp_column_prefix:
-            if a_prefix in prefix:
+            if a_prefix in prefix and "vision_model" not in prefix:
                 return SequenceColumnParallelOp(layer)
 
     return None
@@ -732,9 +734,11 @@ def _get_row_parallel_op(
         return MatmulAllreduceRowParallelOp(layer)
     if flashcomm2_enable():
         if "o_proj" in prefix or "out_proj" in prefix:
-            return Flashcomm2OProjRowParallelOp(layer)
-    if enable_sp() and not _is_multimodal_encoder_prefix(prefix):
-        if "shared_expert" in prefix:
+            if "vision_model" not in prefix:
+                return Flashcomm2OProjRowParallelOp(layer)
+    if enable_sp() not _is_multimodal_encoder_prefix(prefix):
+        # "share_expert" added for Step3p5
+        if "shared_expert" in prefix or "share_expert" in prefix:
             return None
         sp_row_prefixes = [
             "o_proj",  # attn output linear of most LLMs
@@ -744,7 +748,7 @@ def _get_row_parallel_op(
             "wo_b",  # attn output linear of v4
         ]
         for a_prefix in sp_row_prefixes:
-            if a_prefix in prefix:
+            if a_prefix in prefix and "vision_model" not in prefix:
                 return SequenceRowParallelOp(layer)
 
     return None
@@ -755,6 +759,7 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
         disable_tp
         or ("shared_experts" in prefix and shared_expert_dp_enabled())
         or ("shared_expert" in prefix and shared_expert_dp_enabled())
+        or ("share_expert" in prefix and shared_expert_dp_enabled())  # "share_expert" added for Step3p5
     ):
         return None, 0, 1
     custom_op: (
