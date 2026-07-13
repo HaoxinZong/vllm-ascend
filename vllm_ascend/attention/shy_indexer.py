@@ -71,6 +71,25 @@ DECODE_SCORE_AUTOTUNE_CONFIGS = [
 ]
 
 
+def _as_triton_index_kv_cache(
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize Ascend indexer cache to [num_blocks, 128, head_dim]."""
+    if isinstance(index_kv_cache, (tuple, list)):
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 5 and index_kv_cache.shape[0] == 2:
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 4:
+        if index_kv_cache.shape[2] != 1:
+            raise ValueError(
+                f"Unexpected index cache head dim: {tuple(index_kv_cache.shape)}"
+            )
+        index_kv_cache = index_kv_cache.squeeze(2)
+    if index_kv_cache.ndim != 3:
+        raise ValueError(f"Unexpected index cache ndim: {index_kv_cache.ndim}")
+    return index_kv_cache
+
+
 def _read_positive_int_env(name: str, default: int) -> int:
     """Returns a positive integer environment override."""
     value = os.environ.get(name)
@@ -945,7 +964,7 @@ def _copy_topk_indices(
 @torch.no_grad()
 def minimax_m3_index_score(
     idx_q: torch.Tensor,
-    index_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     block_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -961,6 +980,9 @@ def minimax_m3_index_score(
     does not change block ordering, so this score-only path intentionally omits
     it.
     """
+    index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
+    total_q, num_idx_heads, head_dim = idx_q.shape
+    assert num_idx_heads == num_kv_heads
     total_query_tokens, index_head_count, head_dim = idx_q.shape
     assert index_head_count == num_kv_heads, (
         "M3 requires num_idx_heads == num_kv_heads"
@@ -1090,7 +1112,7 @@ def minimax_m3_index_topk(
 @torch.no_grad()
 def minimax_m3_index_decode(
     idx_q: torch.Tensor,
-    index_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -1108,6 +1130,9 @@ def minimax_m3_index_decode(
     ``sm_scale`` is accepted for API compatibility and intentionally omitted
     because this score-only path consumes block ordering.
     """
+
+    index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
+    total_q, num_idx_heads, head_dim = idx_q.shape
     assert topk > 0
     total_query_tokens, index_head_count, head_dim = idx_q.shape
     assert index_head_count == num_kv_heads, (
