@@ -43,8 +43,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from vllm_ascend.attention.msa_m3_npu import minimax_m3_sparse_attn
-from vllm_ascend.attention.msa_m3_triton import (
+from vllm_ascend.attention.msa_m3_npu import (
+    minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
 )
 from vllm_ascend.attention.shy_indexer import (
