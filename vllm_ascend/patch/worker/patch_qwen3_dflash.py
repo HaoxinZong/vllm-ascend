@@ -5,6 +5,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3Model,
 )
 
+
 def precompute_and_store_context_kv(
     self,
     context_states: torch.Tensor,
@@ -67,6 +68,8 @@ def precompute_and_store_context_kv(
 
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv
 
+# This helper was added after the vLLM v0.24 release. Only patch revisions
+# that expose it; older releases do not download a separate mask embedding.
 if hasattr(DFlashQwen3ForCausalLM, "_read_mask_embedding"):
     _orig_read_mask_embedding = DFlashQwen3ForCausalLM._read_mask_embedding
 
