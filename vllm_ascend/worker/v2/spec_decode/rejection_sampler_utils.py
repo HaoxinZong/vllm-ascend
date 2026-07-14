@@ -20,9 +20,7 @@
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.utils import vllm_version_is
-
-if not vllm_version_is("0.23.0"):
+try:
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         _compute_global_logsumexp as _compute_global_lse,
     )
@@ -32,7 +30,7 @@ if not vllm_version_is("0.23.0"):
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         _insert_resampled_kernel,
     )
-else:
+except ImportError:
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         _compute_block_stats_kernel,
         _compute_global_lse,

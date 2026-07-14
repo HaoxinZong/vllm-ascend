@@ -1038,6 +1038,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         sparse_cfg: dict[str, Any] | None = None,
         disable_index_value: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         assert sparse_cfg is not None
@@ -1106,6 +1107,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
