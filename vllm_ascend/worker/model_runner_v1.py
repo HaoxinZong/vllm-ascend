@@ -68,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    MLAAttentionSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -4145,8 +4146,13 @@ class NPUModelRunner(GPUModelRunner):
                     or self.hybrid_with_attn_and_mamba
                     or "cache_only_layers" in layer_name
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
+                    or (
+                        layer_name.endswith(".index_cache")
+                        and isinstance(layer_kv_cache_spec.get(layer_name), MLAAttentionSpec)
+                    )
                 ) and layer_name not in kv_cache_raw_tensors:
-                    # for mamba linear attention, attn-linear hybrid, or cache_only_layers (extract_hidden_states)
+                    # for mamba linear attention, attn-linear hybrid, cache_only_layers
+                    # (extract_hidden_states), or key-only MiniMax-M3 index cache
                     if self.vllm_config.kv_transfer_config is None:
                         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
                     else:
@@ -4456,8 +4462,13 @@ class NPUModelRunner(GPUModelRunner):
                     elif (
                         "cache_only_layers" in layer_name
                         or is_hidden_state_cache_spec(current_kv_cache_spec)
+                        or (
+                            layer_name.endswith(".index_cache")
+                            and isinstance(current_kv_cache_spec, MLAAttentionSpec)
+                        )
                     ):
-                        # Single tensor for extract_hidden_states (no K/V split)
+                        # Single tensor for extract_hidden_states and key-only
+                        # MiniMax-M3 index cache (no K/V split).
                         raw_tensor = kv_cache_raw_tensors[layer_name]
                         assert raw_tensor is not None
                         assert raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
