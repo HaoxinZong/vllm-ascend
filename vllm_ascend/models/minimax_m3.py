@@ -34,6 +34,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.logger import logger
 from vllm.model_executor.layers.attention import Attention
