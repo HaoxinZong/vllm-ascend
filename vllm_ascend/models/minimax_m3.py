@@ -23,13 +23,13 @@
 # limitations under the License.
 """Inference-only MiniMaxM3 model."""
 
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
-from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, cast
 
 import torch
-import vllm
 from torch import nn
 from transformers import BatchFeature, PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -97,37 +97,34 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.utils.import_utils import import_from_path
 
 from vllm_ascend.attention.msa_m3 import MiniMaxM3SparseAttention
 
 
-def _load_vllm_minimax_m3_vision_model() -> type[nn.Module]:
-    """Load vLLM's MiniMax-M3 vision tower without importing its platform entry."""
-    if vllm.__file__ is None:
-        raise ImportError("Unable to locate the installed vLLM package.")
+def _install_fused_allreduce_norm_fallback() -> None:
+    """Avoid importing vLLM's CUDA-only fusion module on Ascend."""
+    module_name = "vllm.model_executor.layers.fused_allreduce_gemma_rms_norm"
+    if module_name in sys.modules:
+        return
 
-    vision_tower_path = (
-        Path(vllm.__file__).resolve().parent
-        / "models"
-        / "minimax_m3"
-        / "common"
-        / "vision_tower.py"
-    )
-    if not vision_tower_path.is_file():
-        raise ImportError(
-            "The vLLM MiniMax M3 vision tower source was not found at "
-            f"{vision_tower_path}. This vllm-ascend adapter requires vLLM 0.24."
-        )
+    fallback_module = ModuleType(module_name)
 
-    vision_tower_module = import_from_path(
-        "vllm_ascend.models._vllm_024_minimax_m3_vision_tower",
-        vision_tower_path,
-    )
-    return vision_tower_module.MiniMaxVLVisionModel
+    def fused_allreduce_gemma_rms_norm(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm: GemmaRMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states)
+        return norm(hidden_states, residual)
+
+    cast(Any, fallback_module).fused_allreduce_gemma_rms_norm = fused_allreduce_gemma_rms_norm
+    sys.modules[module_name] = fallback_module
 
 
-MiniMaxVLVisionModel = _load_vllm_minimax_m3_vision_model()
+_install_fused_allreduce_norm_fallback()
+
+from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel  # noqa: E402
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
