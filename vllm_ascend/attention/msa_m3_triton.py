@@ -221,7 +221,7 @@ def _index_block_score_kernel(
             mask=pos_mask.broadcast_to((head_dim, BLOCK_SIZE_K)),
             other=0.0,
         )
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k, dtype=tl.float32)
         # Causal mask: query_pos >= key_pos
         q_pos = prefix_len + pid_q * BLOCK_SIZE_Q + off_q
         qk = tl.where(q_pos[:, None] >= pos[None, :], qk, float("-inf"))
