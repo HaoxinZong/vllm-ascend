@@ -10,10 +10,21 @@ split cache layout does not need to be materialized into the GPU
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+
+try:
+    from vllm_ascend.ops.triton.triton_utils import (
+        get_aicore_num,
+        init_device_properties_triton,
+    )
+except ImportError:
+    get_aicore_num = None
+    init_device_properties_triton = None
 
 # Data-layout constants.
 SPARSE_BLOCK_SIZE = 128
@@ -21,7 +32,11 @@ SCORE_BLOCK_STRIDE_ALIGNMENT = 16
 
 # Index-score kernel configuration.
 PREFILL_SCORE_QUERY_TILE_SIZE = 96
-PREFILL_SCALAR_SCORE_BLOCK_TILE_SIZE = 32
+
+# Decode score launch policy. The detected device AIC count is used whenever
+# available; 32 is only a fallback when device-property discovery is unavailable.
+DECODE_SCORE_FALLBACK_PROGRAM_COUNT = 32
+DECODE_SCORE_MAX_CHUNK_COUNT = 256
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -36,7 +51,9 @@ def _as_triton_index_kv_cache(
         index_kv_cache = index_kv_cache[0]
     if index_kv_cache.ndim == 4:
         if index_kv_cache.shape[2] != 1:
-            raise ValueError(f"Unexpected index cache head dim: {tuple(index_kv_cache.shape)}")
+            raise ValueError(
+                f"Unexpected index cache head dim: {tuple(index_kv_cache.shape)}"
+            )
         index_kv_cache = index_kv_cache.squeeze(2)
     if index_kv_cache.ndim != 3:
         raise ValueError(f"Unexpected index cache ndim: {index_kv_cache.ndim}")
@@ -60,7 +77,9 @@ def _split_triton_main_kv_cache(
         else:
             raise ValueError(f"Unexpected main kv cache shape: {tuple(kv_cache.shape)}")
     if k_cache.ndim != 4 or v_cache.ndim != 4:
-        raise ValueError(f"Unexpected split main kv cache shapes: {tuple(k_cache.shape)}, {tuple(v_cache.shape)}")
+        raise ValueError(
+            f"Unexpected split main kv cache shapes: {tuple(k_cache.shape)}, {tuple(v_cache.shape)}"
+        )
     return k_cache, v_cache
 
 
@@ -96,14 +115,24 @@ def _sparse_attn_num_stages_kwarg() -> dict:
     return _SPARSE_ATTN_NUM_STAGES_KWARG
 
 
-def _prune_decode_score_configs(configs, named_args, **_):
-    """Keeps decode split-K launches within the configured program budget."""
-    request_count = max(1, named_args["num_reqs"])
-    chunk_limit = max(1, 512 // request_count)
-    chunk_limit = 1 << (chunk_limit.bit_length() - 1)
-    valid_configs = [config for config in configs if config.kwargs["num_kv_chunks"] <= chunk_limit]
-    return valid_configs or configs[:1]
-
+@lru_cache(maxsize=1)
+def _detected_aicore_count() -> int:
+    """Returns the detected Ascend AI Core count, or zero on fallback."""
+    if get_aicore_num is None or init_device_properties_triton is None:
+        return 0
+    try:
+        detected = int(get_aicore_num())
+        if detected > 0:
+            return detected
+    except AssertionError:
+        pass
+    except Exception:
+        return 0
+    try:
+        init_device_properties_triton()
+        return max(0, int(get_aicore_num()))
+    except Exception:
+        return 0
 
 # ---------------------------------------------------------------------------
 # Index block-score kernel (paged). score[h, token, block] = max over the
@@ -183,7 +212,11 @@ def _prefill_index_score_kernel(
 
     block_table_row_ptr = block_table_ptr + batch_id * block_table_batch_stride
 
-    score_row_ptrs = score_ptr + head_id * score_head_stride + (sequence_start + query_offsets) * score_token_stride
+    score_row_ptrs = (
+        score_ptr
+        + head_id * score_head_stride
+        + (sequence_start + query_offsets) * score_token_stride
+    )
 
     # Exclusive upper bound of key positions visible to at least one valid
     # query in this query tile.
@@ -219,7 +252,10 @@ def _prefill_index_score_kernel(
         page_id = tl.load(block_table_row_ptr + block_id).to(tl.int64)
 
         key = tl.load(
-            index_key_cache_ptr + page_id * key_block_stride + key_position_offsets + key_dim_offsets,
+            index_key_cache_ptr
+            + page_id * key_block_stride
+            + key_position_offsets
+            + key_dim_offsets,
         )
 
         query_key = tl.dot(query, key)
@@ -252,7 +288,10 @@ def _prefill_index_score_kernel(
         key_mask = key_positions < sequence_length
 
         key = tl.load(
-            index_key_cache_ptr + page_id * key_block_stride + key_position_offsets + key_dim_offsets,
+            index_key_cache_ptr
+            + page_id * key_block_stride
+            + key_position_offsets
+            + key_dim_offsets,
             mask=key_mask[None, :].broadcast_to((head_dim, BLOCK_SIZE_K)),
             other=0.0,
         )
@@ -279,236 +318,28 @@ def _prefill_index_score_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Scalar (head_dim == 1) prefill specialization.
+# Decode index-score kernel.
 #
-# For a fully visible block and scalar q:
-#   max_j(q * k_j) = q * max_j(k_j), q >= 0
-#                    q * min_j(k_j), q < 0
-#
-# Page extrema are therefore computed once and reused by all query tiles and
-# index heads. Causal-boundary blocks still use the original per-token path.
+# One program-axis-0 item owns one query token, independent of
+# decode_query_len. Index heads are fused in the Q tile, so every dot keeps the
+# fixed shape Q[num_idx_heads, head_dim] @ K[head_dim, 128]. Program axis 1
+# splits the complete score stride using exact quotient/remainder partitioning.
+# The same kernel owns the complete score row. Init/local blocks are written as
+# constants without loading K or running QK; only ordinary visible blocks enter
+# the dot-product path. Invalid blocks and stride padding are written to -inf.
 # ---------------------------------------------------------------------------
-@triton.jit
-def _prefill_scalar_key_extrema_kernel(
-    index_key_cache_ptr,
-    page_extrema_ptr,
-    page_count,
-    key_block_stride,
-    key_position_stride,
-    extrema_page_stride,
-    extrema_value_stride,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """Computes one minimum and maximum for each scalar index-key page."""
-    page_id = tl.program_id(0)
-    if page_id >= page_count:
-        return
-
-    key_lane_offsets = tl.arange(0, BLOCK_SIZE_K)
-    key_values = tl.load(
-        index_key_cache_ptr + page_id * key_block_stride + key_lane_offsets * key_position_stride,
-    ).to(tl.float32)
-
-    page_minimum = tl.min(key_values, axis=0)
-    page_maximum = tl.max(key_values, axis=0)
-    page_extrema_base = page_extrema_ptr + page_id * extrema_page_stride
-    tl.store(
-        page_extrema_base,
-        page_minimum,
-    )
-    tl.store(
-        page_extrema_base + extrema_value_stride,
-        page_maximum,
-    )
-
-
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "sequence_lengths_ptr",
-        "prefix_lengths_ptr",
-    ]
-)
-def _prefill_scalar_index_score_kernel(
-    query_ptr,
-    index_key_cache_ptr,
-    page_extrema_ptr,
-    score_ptr,
-    block_table_ptr,
-    query_start_offsets_ptr,
-    sequence_lengths_ptr,
-    prefix_lengths_ptr,
-    index_head_count: tl.constexpr,
-    query_token_stride,
-    query_head_stride,
-    key_block_stride,
-    key_position_stride,
-    extrema_page_stride,
-    extrema_value_stride,
-    score_head_stride,
-    score_token_stride,
-    score_block_stride,
-    block_table_batch_stride,
-    BLOCK_SIZE_Q: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_B: tl.constexpr,
-):
-    """Computes scalar prefill scores using reusable page extrema."""
-    tl.static_assert(
-        BLOCK_SIZE_Q <= BLOCK_SIZE_K,
-        "BLOCK_SIZE_Q must not exceed BLOCK_SIZE_K",
-    )
-
-    query_tile_id = tl.program_id(0)
-    batch_head_id = tl.program_id(1)
-    batch_id = batch_head_id // index_head_count
-    head_id = batch_head_id % index_head_count
-
-    sequence_start = tl.load(query_start_offsets_ptr + batch_id)
-    sequence_end = tl.load(query_start_offsets_ptr + batch_id + 1)
-    query_length = sequence_end - sequence_start
-    sequence_length = tl.load(sequence_lengths_ptr + batch_id)
-    prefix_length = tl.load(prefix_lengths_ptr + batch_id)
-
-    query_tile_start = query_tile_id * BLOCK_SIZE_Q
-    if query_tile_start >= query_length:
-        return
-
-    query_lane_offsets = tl.arange(0, BLOCK_SIZE_Q)
-    query_offsets = query_tile_start + query_lane_offsets
-    query_mask = query_offsets < query_length
-    query_positions = prefix_length + query_offsets
-    query_values = tl.load(
-        query_ptr + (sequence_start + query_offsets) * query_token_stride + head_id * query_head_stride,
-        mask=query_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    block_table_row_ptr = block_table_ptr + batch_id * block_table_batch_stride
-    score_row_ptrs = score_ptr + head_id * score_head_stride + (sequence_start + query_offsets) * score_token_stride
-
-    query_tile_valid_end = tl.minimum(
-        query_length,
-        query_tile_start + BLOCK_SIZE_Q,
-    )
-    visible_key_end = tl.minimum(
-        sequence_length,
-        prefix_length + query_tile_valid_end,
-    )
-
-    earliest_query_position = prefix_length + query_tile_start
-    causally_full_block_count = (earliest_query_position + 1) // BLOCK_SIZE_K
-    complete_sequence_block_count = sequence_length // BLOCK_SIZE_K
-    full_block_count = tl.minimum(
-        causally_full_block_count,
-        complete_sequence_block_count,
-    )
-
-    # Process several fully visible logical blocks per loop iteration. Each
-    # logical block maps through block_table to a physical page whose extrema
-    # were computed once by _prefill_scalar_key_extrema_kernel.
-    block_lane_offsets = tl.arange(0, BLOCK_SIZE_B)
-    for block_tile_start in tl.range(0, full_block_count, BLOCK_SIZE_B):
-        block_ids = block_tile_start + block_lane_offsets
-        block_mask = block_ids < full_block_count
-        page_ids = tl.load(
-            block_table_row_ptr + block_ids,
-            mask=block_mask,
-            other=0,
-        ).to(tl.int64)
-
-        extrema_base_ptrs = page_extrema_ptr + page_ids * extrema_page_stride
-        page_minimums = tl.load(
-            extrema_base_ptrs,
-            mask=block_mask,
-            other=0.0,
-        )
-        page_maximums = tl.load(
-            extrema_base_ptrs + extrema_value_stride,
-            mask=block_mask,
-            other=0.0,
-        )
-
-        selected_extrema = tl.where(
-            query_values[:, None] >= 0.0,
-            page_maximums[None, :],
-            page_minimums[None, :],
-        )
-        block_scores = query_values[:, None] * selected_extrema
-        tl.store(
-            score_row_ptrs[:, None] + block_ids[None, :] * score_block_stride,
-            block_scores,
-            mask=query_mask[:, None] & block_mask[None, :],
-        )
-
-    # The one or two blocks intersecting the causal/sequence boundary cannot
-    # use whole-page extrema, because some positions in the page are future
-    # tokens for part of the query tile. Keep the exact original computation.
-    key_lane_offsets = tl.arange(0, BLOCK_SIZE_K)
-    key_position_offsets = key_lane_offsets * key_position_stride
-    boundary_key_start = full_block_count * BLOCK_SIZE_K
-    for key_block_start in tl.range(
-        boundary_key_start,
-        visible_key_end,
-        BLOCK_SIZE_K,
-    ):
-        block_id = key_block_start // BLOCK_SIZE_K
-        page_id = tl.load(block_table_row_ptr + block_id).to(tl.int64)
-
-        key_positions = key_block_start + key_lane_offsets
-        key_mask = key_positions < sequence_length
-        key_values = tl.load(
-            index_key_cache_ptr + page_id * key_block_stride + key_position_offsets,
-            mask=key_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        query_key = query_values[:, None] * key_values[None, :]
-        causal_mask = query_mask[:, None] & key_mask[None, :] & (query_positions[:, None] >= key_positions[None, :])
-        query_key = tl.where(
-            causal_mask,
-            query_key,
-            float("-inf"),
-        )
-        block_score = tl.max(query_key, axis=1)
-        tl.store(
-            score_row_ptrs + block_id * score_block_stride,
-            block_score,
-            mask=query_mask,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Decode index-score kernel (split-K over seq blocks). Decode batches are
-# flattened request-major, with a runtime query length used to map each query
-# token back to its request metadata. Chunk counts depend only on shape
-# constants so the grid is fixed within a captured graph. The score scale is omitted
-# because decode only consumes block ordering.
-# ---------------------------------------------------------------------------
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"num_kv_chunks": chunk_count},
-            num_stages=stage_count,
-        )
-        for chunk_count in (1, 2, 4, 8, 16, 32, 64, 128, 256)
-        for stage_count in (1, 2)
-    ],
-    key=["num_idx_heads", "BLOCK_SIZE_Q", "head_dim", "num_reqs"],
-    prune_configs_by={"early_config_prune": _prune_decode_score_configs},
-)
 @triton.jit(do_not_specialize=["decode_query_len"])
 def _decode_index_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
-    score_ptr,  # [num_idx_heads, total_q, max_block]
-    init_mask_ptr,  # [total_q, score_block_stride] bool
-    local_mask_ptr,  # [total_q, score_block_stride] bool
+    score_ptr,  # [num_idx_heads, total_q, score_block_stride]
     block_table_ptr,  # [num_reqs, max_blocks]
-    seq_lens,  # [num_reqs]
+    seq_lens_ptr,  # [num_reqs]
     num_idx_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    num_reqs: tl.constexpr,
     decode_query_len,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -518,118 +349,134 @@ def _decode_index_score_kernel(
     stride_s_h,
     stride_s_n,
     stride_s_k,
-    stride_mask_q,
-    stride_mask_k,
     stride_bt_b,
-    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    BLOCK_SIZE_Q: tl.constexpr,
-    num_kv_chunks,
-    USE_PDL: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCORE_BLOCK_COUNT: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
 ):
-    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
-    h_offsets = hq_offsets // BLOCK_SIZE_Q
-    q_offsets = hq_offsets % BLOCK_SIZE_Q
-    q_mask = q_offsets < decode_query_len
-    q_ids = pid_r * decode_query_len + q_offsets
+    query_id = tl.program_id(0)
+    chunk_id = tl.program_id(1)
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+    request_id = query_id // decode_query_len
+    query_offset = query_id - request_id * decode_query_len
 
-    seq_len = tl.load(seq_lens + pid_r)
-    query_pos = seq_len - decode_query_len + q_offsets
-    # Full-CG padding uses zero-length request rows. Clamp to an empty
-    # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
-    kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
-    num_blocks = (kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    seq_len = tl.load(seq_lens_ptr + request_id)
+    kv_length = tl.maximum(
+        seq_len - decode_query_len + query_offset + 1,
+        0,
+    )
+    valid_block_count = (kv_length + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    full_block_count = kv_length // BLOCK_SIZE_K
+    local_start = tl.maximum(valid_block_count - local_blocks, 0)
 
-    # block-aligned fixed-count split: grid independent of seq_len (captured graph).
-    chunk_size_blocks = (num_blocks + num_kv_chunks - 1) // num_kv_chunks
-    chunk_start_block = pid_c * chunk_size_blocks
-    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
-    if chunk_start_block >= chunk_end_block:
-        return
-    off_k = tl.arange(0, BLOCK_SIZE_K)  # positions within a 128-block
-    off_d = tl.arange(0, head_dim)
-    bt_row = block_table_ptr + pid_r * stride_bt_b
-    # Query vectors for all index heads in a small spec-decode block.
-    q = tl.load(
-        q_ptr + q_ids[:, None] * stride_q_n + h_offsets[:, None] * stride_q_h + off_d[None, :] * stride_q_d,
-        mask=q_mask[:, None],
-        other=0.0,
-    )  # [HQ,D]
-    for blk in tl.range(chunk_start_block, chunk_end_block):
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos[None, :] < kv_len[:, None]
-        # index-K for this page: [D,N] (transposed), same layout as prefill.
-        k = tl.load(
-            ik_cache_ptr + page * stride_ik_blk + off_k[None, :] * stride_ik_pos + off_d[:, None] * stride_ik_d,
-        )  # [D,N]
-        # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
-        # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
-        # fp32 so the per-block max score is exact for the fp8 indexer too.
-        qk = tl.dot(q, k, out_dtype=tl.float32)  # [HQ,N]
-        qk = tl.where(pos_mask & q_mask[:, None], qk, float("-inf"))
-        score = tl.max(qk, axis=1)  # [HQ]
-        mask_off = q_ids * stride_mask_q + blk * stride_mask_k
-        is_init = tl.load(init_mask_ptr + mask_off)!=0
-        is_local = tl.load(local_mask_ptr + mask_off)!=0
-        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+    # Exact quotient/remainder partition: all SCORE_BLOCK_COUNT positions have
+    # exactly one owner and chunk workloads differ by at most one block.
+    blocks_per_chunk: tl.constexpr = SCORE_BLOCK_COUNT // NUM_CHUNKS
+    extra_chunks: tl.constexpr = SCORE_BLOCK_COUNT % NUM_CHUNKS
+    chunk_extra = tl.where(chunk_id < extra_chunks, 1, 0)
+    chunk_start = chunk_id * blocks_per_chunk + tl.minimum(chunk_id, extra_chunks)
+    chunk_end = chunk_start + blocks_per_chunk + chunk_extra
+
+    # Preserve the original priority precedence:
+    #   local (1e29) overrides init (1e30) when the two ranges overlap.
+    valid_end = tl.minimum(chunk_end, valid_block_count)
+    init_end = tl.minimum(valid_end, tl.minimum(init_blocks, local_start))
+    normal_start = tl.maximum(chunk_start, init_blocks)
+    normal_end = tl.minimum(valid_end, local_start)
+    local_begin = tl.maximum(chunk_start, local_start)
+    tail_begin = tl.maximum(chunk_start, valid_block_count)
+
+    head_offsets = tl.arange(0, num_idx_heads)
+    dim_offsets = tl.arange(0, head_dim)
+    key_offsets = tl.arange(0, BLOCK_SIZE_K)
+    block_table_row = block_table_ptr + request_id * stride_bt_b
+    score_row_base = (
+        score_ptr
+        + head_offsets * stride_s_h
+        + query_id * stride_s_n
+    )
+
+    init_score = tl.full((num_idx_heads,), 1e30, tl.float32)
+    for block_id in tl.range(chunk_start, init_end):
         tl.store(
-            score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + blk * stride_s_k,
-            score,
-            mask=q_mask,
+            score_row_base + block_id * stride_s_k,
+            init_score,
         )
 
+    # A chunk containing only init/local/tail blocks does not need Q at all.
+    has_normal_blocks = normal_start < normal_end
+    query = tl.load(
+        q_ptr
+        + query_id * stride_q_n
+        + head_offsets[:, None] * stride_q_h
+        + dim_offsets[None, :] * stride_q_d,
+        mask=has_normal_blocks,
+        other=0.0,
+    )  # [H, D]
 
-# ---------------------------------------------------------------------------
-# Pad unwritten score tail with -inf so torch.topk ignores [num_blocks, max_block).
-# _decode_index_score_kernel only writes [0, row_num_blocks); torch.empty leaves
-# the rest as garbage. Per-token num_blocks matches the top-k invalid mask.
-# Split-K over max_block with a shape-constant chunk count (captured graph-safe).
-# ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["decode_query_len", "max_block", "chunk_blocks"])
-def _fill_decode_score_tail_kernel(
-    score_ptr,  # [num_idx_heads, total_q, score_block_stride] fp32
-    seq_lens,  # [num_reqs]
-    block_size: tl.constexpr,  # sparse block size (128)
-    max_block,
-    decode_query_len,
-    chunk_blocks,  # max_block split count per chunk (shape-constant)
-    stride_s_h,
-    stride_s_b,
-    stride_s_k,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    pid_b = tl.program_id(0)  # flattened query-token id
-    pid_h = tl.program_id(1)
-    pid_chunk = tl.program_id(2)
-    req_id = pid_b // decode_query_len
-    q_offset = pid_b - req_id * decode_query_len
+    # Fully visible ordinary blocks: no position vector and no QK mask.
+    normal_full_end = tl.minimum(normal_end, full_block_count)
+    for block_id in tl.range(normal_start, normal_full_end):
+        page_id = tl.load(block_table_row + block_id).to(tl.int64)
+        key = tl.load(
+            ik_cache_ptr
+            + page_id * stride_ik_blk
+            + key_offsets[None, :] * stride_ik_pos
+            + dim_offsets[:, None] * stride_ik_d,
+        )  # [D, 128]
 
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
-    kv_len = tl.maximum(query_pos + 1, 0)
-    num_blocks = (kv_len + block_size - 1) // block_size
+        query_key = tl.dot(query, key, out_dtype=tl.float32)
+        block_score = tl.max(query_key, axis=1)
+        tl.store(
+            score_row_base + block_id * stride_s_k,
+            block_score,
+        )
 
-    chunk_start = pid_chunk * chunk_blocks
-    chunk_end = tl.minimum(chunk_start + chunk_blocks, max_block)
-    fill_start = tl.maximum(chunk_start, num_blocks)
-    if fill_start >= chunk_end:
-        return
+    # There is at most one partially visible block. Compute it only when it is
+    # an ordinary block; init/local partial blocks are already constant stores.
+    partial_block_id = full_block_count
+    if (
+        (partial_block_id < valid_block_count)
+        & (partial_block_id >= normal_start)
+        & (partial_block_id < normal_end)
+    ):
+        page_id = tl.load(block_table_row + partial_block_id).to(tl.int64)
+        key = tl.load(
+            ik_cache_ptr
+            + page_id * stride_ik_blk
+            + key_offsets[None, :] * stride_ik_pos
+            + dim_offsets[:, None] * stride_ik_d,
+        )
+        query_key = tl.dot(query, key, out_dtype=tl.float32)
+        key_positions = partial_block_id * BLOCK_SIZE_K + key_offsets
+        query_key = tl.where(
+            key_positions[None, :] < kv_length,
+            query_key,
+            float("-inf"),
+        )
+        block_score = tl.max(query_key, axis=1)
+        tl.store(
+            score_row_base + partial_block_id * stride_s_k,
+            block_score,
+        )
 
-    num_to_fill = chunk_end - fill_start
-    off_k = tl.arange(0, BLOCK_SIZE_K)
-    for i in tl.range(0, num_to_fill, BLOCK_SIZE_K):
-        blk = fill_start + i + off_k
-        store_mask = (i + off_k) < num_to_fill
-        s_ptrs = score_ptr + pid_h * stride_s_h + pid_b * stride_s_b + blk * stride_s_k
-        tl.store(s_ptrs, float("-inf"), mask=store_mask)
+    local_score = tl.full((num_idx_heads,), 1e29, tl.float32)
+    for block_id in tl.range(local_begin, valid_end):
+        tl.store(
+            score_row_base + block_id * stride_s_k,
+            local_score,
+        )
+
+    invalid_score = tl.full(
+        (num_idx_heads,),
+        float("-inf"),
+        tl.float32,
+    )
+    for block_id in tl.range(tail_begin, chunk_end):
+        tl.store(
+            score_row_base + block_id * stride_s_k,
+            invalid_score,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +569,9 @@ def _prepare_prefill_topk_scores_kernel(
     token_indices = sequence_start + query_offsets
     prefix_length = tl.load(prefix_lengths_ptr + batch_id)
 
-    valid_block_counts = (prefix_length + query_offsets + sparse_block_size) // sparse_block_size
+    valid_block_counts = (
+        prefix_length + query_offsets + sparse_block_size
+    ) // sparse_block_size
     valid_block_counts = tl.minimum(
         valid_block_counts,
         score_block_count,
@@ -730,7 +579,9 @@ def _prepare_prefill_topk_scores_kernel(
 
     # Because BLOCK_SIZE_Q <= sparse_block_size, one query tile contains at
     # most two consecutive valid-block counts.
-    min_valid_block_count = (prefix_length + query_tile_start + sparse_block_size) // sparse_block_size
+    min_valid_block_count = (
+        prefix_length + query_tile_start + sparse_block_size
+    ) // sparse_block_size
     min_valid_block_count = tl.minimum(
         min_valid_block_count,
         score_block_count,
@@ -740,7 +591,11 @@ def _prepare_prefill_topk_scores_kernel(
         score_block_count,
     )
 
-    score_row_ptrs = score_ptr + head_id * score_head_stride + token_indices[:, None] * score_token_stride
+    score_row_ptrs = (
+        score_ptr
+        + head_id * score_head_stride
+        + token_indices[:, None] * score_token_stride
+    )
     forced_block_offsets = tl.arange(0, BLOCK_SIZE_FORCE)
 
     if init_block_count > 0:
@@ -768,7 +623,10 @@ def _prepare_prefill_topk_scores_kernel(
         tl.store(
             score_row_ptrs + min_local_blocks[None, :] * score_block_stride,
             1e29,
-            mask=(rows_with_min_count[:, None] & (forced_block_offsets[None, :] < min_local_count)),
+            mask=(
+                rows_with_min_count[:, None]
+                & (forced_block_offsets[None, :] < min_local_count)
+            ),
         )
 
         max_local_start = tl.maximum(
@@ -780,7 +638,10 @@ def _prepare_prefill_topk_scores_kernel(
         tl.store(
             score_row_ptrs + max_local_blocks[None, :] * score_block_stride,
             1e29,
-            mask=(rows_with_max_count[:, None] & (forced_block_offsets[None, :] < max_local_count)),
+            mask=(
+                rows_with_max_count[:, None]
+                & (forced_block_offsets[None, :] < max_local_count)
+            ),
         )
 
     tail_lane_offsets = tl.arange(0, BLOCK_SIZE_TAIL)
@@ -836,7 +697,9 @@ def _mask_prefill_topk_indices_kernel(
     query_mask = query_offsets < query_length
     token_indices = sequence_start + query_offsets
     prefix_length = tl.load(prefix_lengths_ptr + batch_id)
-    valid_block_counts = (prefix_length + query_offsets + sparse_block_size) // sparse_block_size
+    valid_block_counts = (
+        prefix_length + query_offsets + sparse_block_size
+    ) // sparse_block_size
 
     index_ptrs = (
         topk_indices_ptr
@@ -865,62 +728,6 @@ def _mask_prefill_topk_indices_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Decode init/local bool masks for index scoring. fp32 intermediates; split-K
-# over max_block with shape-constant chunk count (captured graph-safe).
-# ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["decode_query_len", "max_block", "chunk_blocks"])
-def _prepare_decode_score_masks_kernel(
-    init_mask_ptr,  # [total_q, score_block_stride] bool out
-    local_mask_ptr,  # [total_q, score_block_stride] bool out
-    seq_lens,  # [num_reqs] int32
-    block_size: tl.constexpr,  # sparse block size (128)
-    max_block,
-    decode_query_len,
-    chunk_blocks,
-    init_blocks: tl.constexpr,
-    local_blocks: tl.constexpr,
-    stride_mask_q,
-    stride_mask_k,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    pid_q = tl.program_id(0)
-    pid_chunk = tl.program_id(1)
-    req_id = pid_q // decode_query_len
-    q_offset = pid_q - req_id * decode_query_len
-
-    seq_len = tl.load(seq_lens + req_id).to(tl.float32)
-    query_pos = seq_len - decode_query_len + q_offset
-    kv_len = tl.maximum(query_pos + 1.0, 0.0)
-    valid_blocks = tl.floor((query_pos + block_size * 1.0) / (block_size * 1.0))
-    local_start = tl.maximum(
-        tl.floor((kv_len + (block_size - 1) * 1.0) / (block_size * 1.0)) - local_blocks * 1.0,
-        0.0,
-    )
-
-    chunk_start = pid_chunk * chunk_blocks
-    chunk_end = tl.minimum(chunk_start + chunk_blocks, max_block)
-    if chunk_start >= chunk_end:
-        return
-
-    num_blks = chunk_end - chunk_start
-    off_k = tl.arange(0, BLOCK_SIZE_K)
-    for i in tl.range(0, num_blks, BLOCK_SIZE_K):
-        blk = chunk_start + i + off_k
-        store_mask = (i + off_k) < num_blks
-        blk_f = blk * 1.0
-        blk_valid = blk_f < valid_blocks
-        is_init = (blk_f < init_blocks * 1.0) & blk_valid
-        is_local = (blk_f >= local_start) & blk_valid
-        mask_ptrs = init_mask_ptr + pid_q * stride_mask_q + blk * stride_mask_k
-        tl.store(mask_ptrs, is_init, mask=store_mask)
-        tl.store(
-            local_mask_ptr + pid_q * stride_mask_q + blk * stride_mask_k,
-            is_local,
-            mask=store_mask,
-        )
-
-
-# ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
 # ---------------------------------------------------------------------------
@@ -932,7 +739,8 @@ def _prepare_decode_score_masks_kernel(
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
+        * triton.next_power_of_2(args["gqa_group_size"]),
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -1100,7 +908,9 @@ def _gqa_sparse_fwd_kernel(
 # ---------------------------------------------------------------------------
 @triton.heuristics(
     {
-        "BLOCK_SIZE_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
     }
@@ -1177,7 +987,9 @@ def _gqa_sparse_decode_kernel(
         mask=off_t < max_topk,
         other=-1,
     )
-    topk_valid_blk = (topk_idx >= 0) & (topk_idx < num_valid_blocks) & (topk_idx < max_blocks)
+    topk_valid_blk = (
+        (topk_idx >= 0) & (topk_idx < num_valid_blocks) & (topk_idx < max_blocks)
+    )
     valid_topk = (off_t < max_topk) & topk_valid_blk
     # Keep all positions up to the last valid selected block. This skips only
     # a trailing invalid suffix; the hot loop still has PR33 per-block guards,
@@ -1298,7 +1110,9 @@ def _gqa_sparse_decode_kernel(
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
+@triton.heuristics(
+    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
+)
 @triton.jit
 def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
@@ -1332,7 +1146,11 @@ def _merge_topk_attn_out_kernel(
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     valid_chunk = lse > float("-inf")
     o = tl.load(
-        o_ptr + off_c[:, None] * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h + off_d[None, :] * stride_o_d,
+        o_ptr
+        + off_c[:, None] * stride_o_c
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + off_d[None, :] * stride_o_d,
         mask=valid_chunk[:, None] & (off_d[None, :] < head_dim),
         other=0.0,
     )
@@ -1344,7 +1162,9 @@ def _merge_topk_attn_out_kernel(
     denom_safe = tl.where(denom > 0.0, denom, 1.0)
     o_merged = tl.sum(o * weights[:, None], axis=0) / denom_safe
     o_merged = tl.where(has_lse, o_merged, tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32))
-    out_ptrs = out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
+    out_ptrs = (
+        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
+    )
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
@@ -1389,12 +1209,9 @@ def minimax_m3_index_score(
     num_kv_heads: int,
     sm_scale: float | None = None,
 ) -> torch.Tensor:
-    """Computes one block score for every visible prefill KV block.
+    
+    del sm_scale  # unused for prefill scoring
 
-    ``sm_scale`` is accepted for API compatibility. A positive global scale
-    does not change block ordering, so this score-only path intentionally omits
-    it.
-    """
     index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
     total_query_tokens, index_head_count, head_dim = idx_q.shape
     assert index_head_count == num_kv_heads, "M3 requires num_idx_heads == num_kv_heads"
@@ -1415,71 +1232,29 @@ def minimax_m3_index_score(
         triton.cdiv(max_query_len, PREFILL_SCORE_QUERY_TILE_SIZE),
         batch_size * index_head_count,
     )
-    if head_dim == 1:
-        page_count = index_kv_cache.shape[0]
-        page_extrema = torch.empty(
-            (page_count, 2),
-            dtype=torch.float32,
-            device=index_kv_cache.device,
-        )
-        _prefill_scalar_key_extrema_kernel[(page_count,)](
-            index_kv_cache,
-            page_extrema,
-            page_count,
-            index_kv_cache.stride(0),
-            index_kv_cache.stride(1),
-            page_extrema.stride(0),
-            page_extrema.stride(1),
-            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        )
-        _prefill_scalar_index_score_kernel[score_grid](
-            idx_q,
-            index_kv_cache,
-            page_extrema,
-            score,
-            block_table,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            index_head_count,
-            idx_q.stride(0),
-            idx_q.stride(1),
-            index_kv_cache.stride(0),
-            index_kv_cache.stride(1),
-            page_extrema.stride(0),
-            page_extrema.stride(1),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            block_table.stride(0),
-            BLOCK_SIZE_Q=PREFILL_SCORE_QUERY_TILE_SIZE,
-            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-            BLOCK_SIZE_B=PREFILL_SCALAR_SCORE_BLOCK_TILE_SIZE,
-        )
-    else:
-        _prefill_index_score_kernel[score_grid](
-            idx_q,
-            index_kv_cache,
-            score,
-            block_table,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            index_head_count,
-            head_dim,
-            idx_q.stride(0),
-            idx_q.stride(1),
-            idx_q.stride(2),
-            index_kv_cache.stride(0),
-            index_kv_cache.stride(1),
-            index_kv_cache.stride(2),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            block_table.stride(0),
-            BLOCK_SIZE_Q=PREFILL_SCORE_QUERY_TILE_SIZE,
-            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        )
+    _prefill_index_score_kernel[score_grid](
+        idx_q,
+        index_kv_cache,
+        score,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        index_head_count,
+        head_dim,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        index_kv_cache.stride(0),
+        index_kv_cache.stride(1),
+        index_kv_cache.stride(2),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        block_table.stride(0),
+        BLOCK_SIZE_Q=PREFILL_SCORE_QUERY_TILE_SIZE,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+    )
     return score
 
 
@@ -1581,11 +1356,9 @@ def minimax_m3_index_decode(
     out: torch.Tensor | None = None,
     sm_scale: float | None = None,
 ) -> torch.Tensor:
-    """Computes decode block scores and returns zero-based top-k block IDs.
+    
+    del sm_scale  # unused for decode scoring
 
-    ``sm_scale`` is accepted for API compatibility and intentionally omitted
-    because this score-only path consumes block ordering.
-    """
     index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
     assert topk > 0
     total_query_tokens, index_head_count, head_dim = idx_q.shape
@@ -1608,52 +1381,36 @@ def minimax_m3_index_decode(
         dtype=torch.float32,
         device=idx_q.device,
     )
-
-    init_mask = torch.zeros(
-        (total_query_tokens, score_block_stride),
-        dtype=torch.bool,
-        device=seq_lens.device,
+    detected_aicore_count = _detected_aicore_count()
+    target_program_count = (
+        detected_aicore_count
+        if detected_aicore_count > 0
+        else DECODE_SCORE_FALLBACK_PROGRAM_COUNT
     )
-    local_mask = torch.zeros_like(init_mask)
-    mask_chunk_count = max(
+    num_kv_chunks = triton.cdiv(
+        target_program_count,
+        max(1, total_query_tokens),
+    )
+    num_kv_chunks = max(
         1,
-        min(16, 64 // max(1, total_query_tokens)),
-    )
-    mask_chunk_blocks = triton.cdiv(max_block_count, mask_chunk_count)
-    _prepare_decode_score_masks_kernel[(total_query_tokens, mask_chunk_count)](
-        init_mask,
-        local_mask,
-        seq_lens,
-        SPARSE_BLOCK_SIZE,
-        max_block_count,
-        decode_query_len,
-        mask_chunk_blocks,
-        init_blocks,
-        local_blocks,
-        init_mask.stride(0),
-        init_mask.stride(1),
-        BLOCK_SIZE_K=2048,
+        min(
+            num_kv_chunks,
+            DECODE_SCORE_MAX_CHUNK_COUNT,
+            score_block_stride,
+        ),
     )
 
-    use_pdl = current_platform.is_arch_support_pdl()
-    launch_kwargs = {"launch_pdl": True} if use_pdl else {}
-    decode_query_tile_size = triton.next_power_of_2(max_decode_query_len)
-    decode_score_grid = lambda metadata: (
-        request_count,
-        metadata["num_kv_chunks"],
-    )
-    _decode_index_score_kernel[decode_score_grid](
+    _decode_index_score_kernel[(total_query_tokens, num_kv_chunks)](
         idx_q,
         index_kv_cache,
         score,
-        init_mask,
-        local_mask,
         block_table,
         seq_lens,
         index_head_count,
         head_dim,
-        request_count,
         decode_query_len,
+        init_blocks,
+        local_blocks,
         idx_q.stride(0),
         idx_q.stride(1),
         idx_q.stride(2),
@@ -1663,34 +1420,10 @@ def minimax_m3_index_decode(
         score.stride(0),
         score.stride(1),
         score.stride(2),
-        init_mask.stride(0),
-        init_mask.stride(1),
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        BLOCK_SIZE_Q=decode_query_tile_size,
-        USE_PDL=use_pdl,
-        **launch_kwargs,
-    )
-
-    tail_chunk_count = max(
-        1,
-        min(
-            16,
-            64 // max(1, total_query_tokens * index_head_count),
-        ),
-    )
-    tail_chunk_blocks = triton.cdiv(max_block_count, tail_chunk_count)
-    _fill_decode_score_tail_kernel[(total_query_tokens, index_head_count, tail_chunk_count)](
-        score,
-        seq_lens,
-        SPARSE_BLOCK_SIZE,
-        max_block_count,
-        decode_query_len,
-        tail_chunk_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        BLOCK_SIZE_K=2048,
+        SCORE_BLOCK_COUNT=score_block_stride,
+        NUM_CHUNKS=num_kv_chunks,
     )
 
     selected_count = min(topk, max_block_count)
@@ -1825,7 +1558,9 @@ def minimax_m3_sparse_attn_decode(
         dtype=q.dtype,
         device=q.device,
     )
-    lse_partial = torch.empty(num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device)
+    lse_partial = torch.empty(
+        num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
+    )
     grid = (total_q * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
         q,
