@@ -11,6 +11,11 @@ split cache layout does not need to be materialized into the GPU
 from __future__ import annotations
 
 import torch
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
@@ -98,11 +103,15 @@ def _sparse_attn_num_stages_kwarg() -> dict:
 
 def _prune_decode_score_configs(configs, named_args, **_):
     """Keeps decode split-K launches within the configured program budget."""
-    request_count = max(1, named_args["num_reqs"])
-    chunk_limit = max(1, 512 // request_count)
-    chunk_limit = 1 << (chunk_limit.bit_length() - 1)
+    chunk_limit = _decode_score_chunk_limit(named_args["num_reqs"])
     valid_configs = [config for config in configs if config.kwargs["num_kv_chunks"] <= chunk_limit]
     return valid_configs or configs[:1]
+
+
+def _decode_score_chunk_limit(num_reqs: int) -> int:
+    request_count = max(1, num_reqs)
+    chunk_limit = max(1, 512 // request_count)
+    return 1 << (chunk_limit.bit_length() - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +591,106 @@ def _decode_index_score_kernel(
         score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
         tl.store(
             score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + blk * stride_s_k,
+            score,
+            mask=q_mask,
+        )
+
+
+@triton.jit(do_not_specialize=["decode_query_len", "block_start", "shard_block_count"])
+def _decode_index_partial_topk_kernel(
+    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    score_ptr,  # shard scores: [num_idx_heads, total_q, shard_score_stride]
+    block_table_ptr,  # [num_reqs, max_blocks]
+    seq_lens,  # [num_reqs]
+    num_idx_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_reqs: tl.constexpr,
+    decode_query_len,
+    block_start,
+    shard_block_count,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    num_kv_chunks: tl.constexpr,
+):
+    """Score only this TP rank's block shard.
+
+    The host-side wrapper applies torch.topk on this shard and then merges the
+    per-rank candidates across TP. Keeping the output as a shard-local score
+    matrix avoids the full max_block score traffic on every rank.
+    """
+    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
+    pid_r = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
+    h_offsets = hq_offsets // BLOCK_SIZE_Q
+    q_offsets = hq_offsets % BLOCK_SIZE_Q
+    q_mask = q_offsets < decode_query_len
+    q_ids = pid_r * decode_query_len + q_offsets
+
+    seq_len = tl.load(seq_lens + pid_r)
+    query_pos = seq_len - decode_query_len + q_offsets
+    kv_len = tl.maximum(query_pos + 1, 0)
+    kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
+    visible_blocks_max = (kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    shard_visible_blocks = tl.maximum(
+        tl.minimum(shard_block_count, visible_blocks_max - block_start),
+        0,
+    )
+    chunk_size_blocks = (shard_visible_blocks + num_kv_chunks - 1) // num_kv_chunks
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, shard_visible_blocks)
+    if chunk_start_block >= chunk_end_block:
+        return
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, head_dim)
+    bt_row = block_table_ptr + pid_r * stride_bt_b
+    q = tl.load(
+        q_ptr
+        + q_ids[:, None] * stride_q_n
+        + h_offsets[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+
+    num_blocks_q = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    local_start = tl.maximum(0, num_blocks_q - local_blocks)
+    for local_blk in tl.range(chunk_start_block, chunk_end_block):
+        global_blk = block_start + local_blk
+        page = tl.load(bt_row + global_blk).to(tl.int64)
+        pos = global_blk * BLOCK_SIZE_K + off_k
+        pos_mask = pos[None, :] < kv_len[:, None]
+        k = tl.load(
+            ik_cache_ptr
+            + page * stride_ik_blk
+            + off_k[None, :] * stride_ik_pos
+            + off_d[:, None] * stride_ik_d,
+        )
+        qk = tl.dot(q, k, out_dtype=tl.float32)
+        qk = tl.where(pos_mask & q_mask[:, None], qk, float("-inf"))
+        score = tl.max(qk, axis=1)
+
+        is_visible_block = global_blk < num_blocks_q
+        is_init = (global_blk < init_blocks) & is_visible_block
+        is_local = (global_blk >= local_start) & is_visible_block
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(
+            score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + local_blk * stride_s_k,
             score,
             mask=q_mask,
         )
@@ -1563,6 +1672,165 @@ def minimax_m3_index_topk(
         BLOCK_SIZE_Q=mask_query_tile_size,
     )
     return topk_indices
+
+
+@torch.no_grad()
+def minimax_m3_index_decode_tp_sharded(
+    idx_q: torch.Tensor,
+    index_kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_kv_heads: int,
+    decode_query_len: int,
+    max_decode_query_len: int | None = None,
+    out: torch.Tensor | None = None,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    """TP-sharded decode indexer.
+
+    Every rank gathers the tiny index-query tensor, scores only a shard of the
+    sequence blocks, all-gathers the per-rank top-k candidates, and merges them.
+    This keeps the full index-K cache from being scanned independently by every
+    TP rank.
+    """
+    del sm_scale
+    index_kv_cache = _as_triton_index_kv_cache(index_kv_cache)
+    assert topk > 0
+    total_query_tokens, local_index_head_count, head_dim = idx_q.shape
+    assert local_index_head_count == num_kv_heads, "M3 requires num_idx_heads == num_kv_heads"
+
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+    if tp_size == 1:
+        return minimax_m3_index_decode(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            topk,
+            init_blocks,
+            local_blocks,
+            num_kv_heads,
+            decode_query_len,
+            max_decode_query_len,
+            out,
+        )
+
+    if max_decode_query_len is None:
+        max_decode_query_len = decode_query_len
+    assert decode_query_len <= max_decode_query_len
+
+    request_count = seq_lens.shape[0]
+    assert total_query_tokens == request_count * decode_query_len
+
+    all_idx_q = tensor_model_parallel_all_gather(idx_q.contiguous(), dim=1)
+    all_index_head_count = all_idx_q.shape[1]
+    max_block_count = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    block_start = max_block_count * tp_rank // tp_size
+    block_end = max_block_count * (tp_rank + 1) // tp_size
+    shard_block_count = max(0, block_end - block_start)
+
+    local_topk_scores = torch.full(
+        (all_index_head_count, total_query_tokens, topk),
+        float("-inf"),
+        dtype=torch.float32,
+        device=idx_q.device,
+    )
+    local_topk_indices = torch.full(
+        (all_index_head_count, total_query_tokens, topk),
+        -1,
+        dtype=torch.int32,
+        device=idx_q.device,
+    )
+
+    if shard_block_count > 0:
+        shard_score_stride = round_up(shard_block_count, SCORE_BLOCK_STRIDE_ALIGNMENT)
+        shard_scores = torch.full(
+            (all_index_head_count, total_query_tokens, shard_score_stride),
+            float("-inf"),
+            dtype=torch.float32,
+            device=idx_q.device,
+        )
+        decode_query_tile_size = triton.next_power_of_2(max_decode_query_len)
+        decode_score_chunk_count = min(
+            shard_block_count,
+            _decode_score_chunk_limit(request_count),
+        )
+        decode_score_grid = (request_count, decode_score_chunk_count)
+        _decode_index_partial_topk_kernel[decode_score_grid](
+            all_idx_q,
+            index_kv_cache,
+            shard_scores,
+            block_table,
+            seq_lens,
+            all_index_head_count,
+            head_dim,
+            request_count,
+            decode_query_len,
+            block_start,
+            shard_block_count,
+            init_blocks,
+            local_blocks,
+            all_idx_q.stride(0),
+            all_idx_q.stride(1),
+            all_idx_q.stride(2),
+            index_kv_cache.stride(0),
+            index_kv_cache.stride(1),
+            index_kv_cache.stride(2),
+            shard_scores.stride(0),
+            shard_scores.stride(1),
+            shard_scores.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_Q=decode_query_tile_size,
+            num_kv_chunks=decode_score_chunk_count,
+            num_stages=1,
+        )
+
+        selected_count = min(topk, shard_block_count)
+        shard_score_rows = shard_scores[:, :total_query_tokens, :shard_block_count]
+        raw_scores, raw_indices = torch.topk(
+            shard_score_rows,
+            k=selected_count,
+            dim=-1,
+        )
+        local_topk_scores[..., :selected_count].copy_(raw_scores)
+        local_topk_indices[..., :selected_count].copy_(
+            raw_indices.to(torch.int32) + block_start
+        )
+
+    gathered_scores = tensor_model_parallel_all_gather(local_topk_scores, dim=-1)
+    gathered_indices = tensor_model_parallel_all_gather(local_topk_indices, dim=-1)
+    final_scores, final_positions = torch.topk(gathered_scores, k=topk, dim=-1)
+    del final_scores
+    final_indices_all = torch.gather(gathered_indices, -1, final_positions).to(torch.int32)
+
+    head_start = tp_rank * local_index_head_count
+    head_end = head_start + local_index_head_count
+    final_indices = final_indices_all[head_start:head_end, :total_query_tokens, :]
+
+    if out is not None:
+        result = out[:, :total_query_tokens, :topk]
+        result.copy_(final_indices)
+    else:
+        result = final_indices.contiguous()
+
+    _mask_decode_topk_indices_kernel[(total_query_tokens, local_index_head_count)](
+        result,
+        seq_lens,
+        SPARSE_BLOCK_SIZE,
+        topk,
+        decode_query_len,
+        result.stride(0),
+        result.stride(1),
+        result.stride(2),
+    )
+    return result
 
 
 @torch.no_grad()

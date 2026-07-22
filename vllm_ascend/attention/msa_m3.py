@@ -11,7 +11,10 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -47,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.attention.msa_m3_npu import minimax_m3_sparse_attn
 from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_index_decode,
+    minimax_m3_index_decode_tp_sharded,
     minimax_m3_index_score,
     minimax_m3_index_topk,
     minimax_m3_sparse_attn_decode,
@@ -352,7 +356,12 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            decode_topk = minimax_m3_index_decode(
+            index_decode = (
+                minimax_m3_index_decode_tp_sharded
+                if get_tensor_model_parallel_world_size() > 1
+                else minimax_m3_index_decode
+            )
+            decode_topk = index_decode(
                 iq[:num_decode_tokens],
                 kv,
                 d.block_table,
