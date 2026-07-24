@@ -368,18 +368,23 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         )
         gathered_scores = tp_group.all_gather(local_scores.contiguous(), dim=-1)
         gathered_topk = tp_group.all_gather(local_topk.contiguous(), dim=-1)
-        merged_scores, merged_pos = torch.topk(
-            gathered_scores,
-            k=self.topk_blocks,
-            dim=-1,
-        )
-        merged_topk = torch.gather(gathered_topk, dim=-1, index=merged_pos).to(torch.int32)
-        merged_topk = torch.where(merged_scores > float("-inf"), merged_topk, -1)
 
         local_head_count = idx_q.shape[1]
         local_head_start = tp_rank * local_head_count
-        local_head_end = local_head_start + local_head_count
-        return merged_topk[local_head_start:local_head_end, :, :].contiguous()
+        local_gathered_scores = gathered_scores.narrow(
+            0, local_head_start, local_head_count
+        )
+        _, merged_pos = torch.topk(
+            local_gathered_scores,
+            k=self.topk_blocks,
+            dim=-1,
+        )
+        local_gathered_topk = gathered_topk.narrow(
+            0, local_head_start, local_head_count
+        )
+        merged_topk = torch.gather(local_gathered_topk, dim=-1, index=merged_pos)
+
+        return merged_topk
 
     def forward(
         self,
