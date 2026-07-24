@@ -715,6 +715,86 @@ def _mask_decode_topk_indices_kernel(
     tl.store(ti_ptrs, masked_idx.to(ti_ptr.dtype.element_ty), mask=store_mask)
 
 
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_B": lambda args: triton.next_power_of_2(max(1, args["max_block_count"])),
+    }
+)
+@triton.jit(do_not_specialize=["decode_query_len", "block_offset"])
+def _decode_score_topk_kernel(
+    score_ptr,  # [num_idx_heads, total_q, score_block_stride]
+    topk_idx_ptr,  # [num_idx_heads, total_q, topk]
+    topk_score_ptr,  # [num_idx_heads, total_q, topk], used when RETURN_SCORES
+    seq_lens,  # local sequence lengths inside this block shard, [num_reqs]
+    global_seq_lens,  # full sequence lengths, [num_reqs]
+    block_offset,
+    max_block_count: tl.constexpr,
+    topk: tl.constexpr,
+    decode_query_len,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_k,
+    stride_ts_h,
+    stride_ts_n,
+    stride_ts_k,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_B: tl.constexpr,
+    RETURN_SCORES: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    req_id = pid_n // decode_query_len
+    q_offset = pid_n - req_id * decode_query_len
+    local_seq_len = tl.load(seq_lens + req_id)
+    global_seq_len = tl.load(global_seq_lens + req_id)
+    query_pos = global_seq_len - decode_query_len + q_offset
+    local_kv_len = tl.minimum(
+        tl.maximum(query_pos + 1 - block_offset * BLOCK_SIZE_K, 0),
+        local_seq_len,
+    )
+    num_blocks = (local_kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    off_b = tl.arange(0, BLOCK_SIZE_B)
+    score_offsets = (
+        score_ptr
+        + pid_h * stride_s_h
+        + pid_n * stride_s_n
+        + off_b * stride_s_k
+    )
+    block_mask = off_b < max_block_count
+    scores = tl.load(score_offsets, mask=block_mask, other=float("-inf"))
+
+    idx_base = topk_idx_ptr + pid_h * stride_ti_h + pid_n * stride_ti_n
+    score_base = topk_score_ptr + pid_h * stride_ts_h + pid_n * stride_ts_n
+    valid_rank_limit = tl.minimum(topk, num_blocks)
+
+    for topk_pos in tl.static_range(0, topk):
+        best_score = tl.max(scores, axis=0)
+        best_idx = tl.argmax(scores, axis=0).to(tl.int32)
+        valid = (
+            (topk_pos < valid_rank_limit)
+            & (best_idx >= 0)
+            & (best_idx < num_blocks)
+            & (best_score > float("-inf"))
+        )
+        out_idx = tl.where(valid, best_idx + block_offset, -1)
+        tl.store(
+            idx_base + topk_pos * stride_ti_k,
+            out_idx.to(topk_idx_ptr.dtype.element_ty),
+        )
+        if RETURN_SCORES:
+            out_score = tl.where(valid, best_score, float("-inf"))
+            tl.store(
+                score_base + topk_pos * stride_ts_k,
+                out_score,
+            )
+        scores = tl.where(off_b == best_idx, float("-inf"), scores)
+
+
 # ---------------------------------------------------------------------------
 # Prefill score finalization before torch.topk.
 #
@@ -1673,31 +1753,47 @@ def minimax_m3_index_decode(
         NUM_CHUNKS=num_kv_chunks,
     )
 
-    selected_count = min(topk, max_block_count)
-    score_rows = score[:, :total_query_tokens, :max_block_count]
-    raw_values, raw_indices = torch.topk(
-        score_rows,
-        k=selected_count,
-        dim=-1,
+    if out is None:
+        topk_indices = torch.empty(
+            (index_head_count, total_query_tokens, topk),
+            dtype=torch.int32,
+            device=idx_q.device,
+        )
+    else:
+        topk_indices = out[:, :total_query_tokens, :topk]
+    topk_scores = (
+        torch.empty(
+            (index_head_count, total_query_tokens, topk),
+            dtype=torch.float32,
+            device=idx_q.device,
+        )
+        if return_scores
+        else None
     )
-    topk_indices = _copy_topk_indices(raw_indices, topk, out)
-    topk_scores = _copy_topk_values(raw_values, topk) if return_scores else None
-
-    _mask_decode_topk_indices_kernel[(total_query_tokens, index_head_count)](
+    _decode_score_topk_kernel[(total_query_tokens, index_head_count)](
+        score,
         topk_indices,
+        topk_scores if topk_scores is not None else score,
         seq_lens,
         global_seq_lens,
-        SPARSE_BLOCK_SIZE,
         block_offset,
+        max_block_count,
         topk,
         decode_query_len,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
         topk_indices.stride(0),
         topk_indices.stride(1),
         topk_indices.stride(2),
+        topk_scores.stride(0) if topk_scores is not None else score.stride(0),
+        topk_scores.stride(1) if topk_scores is not None else score.stride(1),
+        topk_scores.stride(2) if topk_scores is not None else score.stride(2),
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        RETURN_SCORES=return_scores,
     )
     if return_scores:
         assert topk_scores is not None
-        topk_scores = torch.where(topk_indices >= 0, topk_scores, float("-inf"))
         return topk_indices, topk_scores
     return topk_indices
 
