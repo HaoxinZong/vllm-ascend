@@ -78,8 +78,7 @@ def _scatter_index_cache(
     """Write index keys into the paged index cache via ``npu_scatter_pa_cache``.
 
     Uses CANN ScatterPaCache scene-1 (``key [T,1,D]``, ``keyCache [B,blk,1,D]``).
-    Padding slots (``slot < 0``) are ignored by the PA scatter op. Falls back to
-    ``npu_scatter_nd_update_`` when ``npu_scatter_pa_cache`` is unavailable.
+    Padding slots (``slot < 0``) are ignored by the PA scatter op.
     """
     slots = slot_mapping.reshape(-1)
     num_tokens = slots.numel()
@@ -90,55 +89,19 @@ def _scatter_index_cache(
     if updates.dtype != cache.dtype:
         updates = updates.to(cache.dtype)
 
-    if hasattr(torch_npu, "npu_scatter_pa_cache"):
-        head_dim = cache.shape[-1]
-        slots = slots.contiguous()
-        if cache.ndim == 2:
-            num_blocks = cache.shape[0] // block_size
-            pa_cache = cache.view(num_blocks, block_size, 1, head_dim)
-        elif cache.ndim == 3:
-            pa_cache = cache.unsqueeze(2)
-        elif cache.ndim == 4:
-            pa_cache = cache
-        else:
-            raise ValueError(f"Unexpected index cache ndim: {cache.ndim}")
-        key = updates.reshape(num_tokens, 1, head_dim).contiguous()
-        torch_npu.npu_scatter_pa_cache(key, slots, key_cache=pa_cache)
-        return
-
-    # Fallback: legacy scatter_nd_update path (non-A5 / older torch_npu).
-    work_cache = cache
-    work_updates = updates
-    if cache.dtype == torch.float8_e4m3fn:
-        work_cache = cache.view(torch.uint8)
-        work_updates = updates.view(torch.uint8)
-
-    valid = slots >= 0
-    first_valid_idx = torch.argmax(valid.to(torch.int32)).reshape(1)
-    has_valid = valid.any()
-
-    first_valid_slot = torch.index_select(slots, 0, first_valid_idx).squeeze(0)
-    first_valid_update = torch.index_select(
-        work_updates, 0, first_valid_idx
-    ).squeeze(0)
-
-    fallback_slot = torch.where(
-        has_valid,
-        first_valid_slot,
-        slots.new_zeros(()),
-    )
-    fallback_update = torch.where(
-        has_valid,
-        first_valid_update,
-        work_cache[0],
-    )
-    safe_slots = torch.where(valid, slots, fallback_slot).view(-1, 1)
-    safe_updates = torch.where(
-        valid.view(-1, 1),
-        work_updates,
-        fallback_update.view(1, -1),
-    )
-    torch_npu.npu_scatter_nd_update_(work_cache, safe_slots, safe_updates)
+    head_dim = cache.shape[-1]
+    slots = slots.contiguous()
+    if cache.ndim == 2:
+        num_blocks = cache.shape[0] // block_size
+        pa_cache = cache.view(num_blocks, block_size, 1, head_dim)
+    elif cache.ndim == 3:
+        pa_cache = cache.unsqueeze(2)
+    elif cache.ndim == 4:
+        pa_cache = cache
+    else:
+        raise ValueError(f"Unexpected index cache ndim: {cache.ndim}")
+    key = updates.reshape(num_tokens, 1, head_dim).contiguous()
+    torch_npu.npu_scatter_pa_cache(key, slots, key_cache=pa_cache)
 
 
 def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:
