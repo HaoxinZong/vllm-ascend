@@ -1,6 +1,7 @@
 /**
  * K2qCsrScatter apt（ascend950 / A5）。
- * use_simt=1 → SIMT（核内 Fill+SyncAll）；=0 → 共用 MC（Host fill，无 SyncAll）。
+ * use_simt=1 → SIMT（Host fill_-1，无核内 Fill+SyncAll）；
+ * use_simt=0 → 共用 MC（与 A2 / non-apt 一致）。
  */
 #include "kernel_operator.h"
 #include "common/k2q_csr_tiling.h"

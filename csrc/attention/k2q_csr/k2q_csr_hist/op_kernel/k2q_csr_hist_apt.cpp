@@ -1,6 +1,6 @@
 /**
  * K2qCsrHist apt（ascend950 / A5）。
- * use_simt=1 → SIMT；=0 → 共用 MC。
+ * use_simt=1 → SIMT VF；=0 → 共用 MC（与 A2 / non-apt 一致，可移植）。
  */
 #include "kernel_operator.h"
 #include "common/k2q_csr_tiling.h"

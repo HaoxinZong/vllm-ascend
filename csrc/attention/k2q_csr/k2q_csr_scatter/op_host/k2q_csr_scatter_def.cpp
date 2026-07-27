@@ -1,7 +1,7 @@
 /**
  * K2qCsrScatter op definition.
  * Inputs: q2k, cu_seqlens, scratch | Outputs: q_ind, slot
- * Attrs: total_rows, max_kv, use_simt
+ * Attrs: total_rows, max_kv, use_simt, q_global_offset
  */
 #include "register/op_def.h"
 #include "register/op_def_registry.h"
@@ -45,6 +45,7 @@ public:
         this->Attr("total_rows").AttrType(REQUIRED).Int(0);
         this->Attr("max_kv").AttrType(REQUIRED).Int(0);
         this->Attr("use_simt").AttrType(REQUIRED).Int(0);
+        this->Attr("q_global_offset").AttrType(REQUIRED).Int(0);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

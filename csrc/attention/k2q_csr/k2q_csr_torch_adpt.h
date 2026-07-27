@@ -118,10 +118,12 @@ inline void k2q_csr_calc_cu_block_stats(const at::Tensor &cu_block_lens, int64_t
  * Stages: Meta -> Hist -> RowPrefix -> TilePrefix -> Scatter
  * total_rows / max_kv: use CPU values when >= 0; otherwise derive via D2H.
  * use_simt: Hist/Scatter SIMT on ascend950 (ignored on other SoCs by tiling).
+ * q_global_offset: 1 → q_ind is global Q token index; 0 → batch-local (default).
  */
 inline std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_k2q_csr(
     const at::Tensor &q2k, const at::Tensor &cu_seqlens, const at::Tensor &cu_block_lens,
-    int64_t order_method, int64_t total_rows, int64_t max_kv, int64_t use_simt)
+    int64_t order_method, int64_t total_rows, int64_t max_kv, int64_t use_simt,
+    int64_t q_global_offset = 0)
 {
     TORCH_CHECK(q2k.defined() && cu_seqlens.defined() && cu_block_lens.defined(),
                 "npu_k2q_csr: inputs must be defined");
@@ -139,6 +141,7 @@ inline std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_k2q_csr(
     TORCH_CHECK(max_kv >= 0, "max_kv must be >= 0, got ", max_kv);
 
     const int64_t use_simt_i = (use_simt != 0) ? 1 : 0;
+    const int64_t q_global_offset_i = (q_global_offset != 0) ? 1 : 0;
 
     const int64_t H = q2k.size(0);
     const int64_t T = q2k.size(1);
@@ -186,7 +189,8 @@ inline std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_k2q_csr(
     q_ind.fill_(-1);
     slot.fill_(-1);
 
-    EXEC_NPU_CMD(aclnnK2qCsrScatter, q2k_c, cu_q, scratch, total_rows, max_kv, use_simt_i, q_ind, slot);
+    EXEC_NPU_CMD(aclnnK2qCsrScatter, q2k_c, cu_q, scratch, total_rows, max_kv, use_simt_i,
+                 q_global_offset_i, q_ind, slot);
 
     return std::make_tuple(row_ptr, q_ind, slot);
 }

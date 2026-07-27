@@ -9,6 +9,7 @@
 #include "arch35/k2q_csr_tiling_arch35.h"
 
 #include "log/log.h"
+// vllm-ascend：头文件在 csrc/common/include/tiling_base/（勿用 ops-transformer 的 op_host/）
 #include "tiling_base/tiling_templates_registry.h"
 #include "tiling_base/tiling_util.h"
 #include "platform/platform_infos_def.h"
@@ -153,7 +154,7 @@ inline ge::graphStatus GetShapeAttrsPrefix(gert::TilingContext *context, int64_t
     return ge::GRAPH_SUCCESS;
 }
 
-/** Scatter: in0=q2k, in1=cu_q；attrs: total_rows,max_kv,use_simt */
+/** Scatter: in0=q2k, in1=cu_q；attrs: total_rows,max_kv,use_simt,q_global_offset */
 inline ge::graphStatus GetShapeAttrsScatter(gert::TilingContext *context, int64_t &H, int64_t &T, int64_t &topk,
                                             int64_t &B, int64_t &totalRows, int64_t &maxKv, int64_t &rowMapElems,
                                             int32_t &orderMethod)
@@ -243,6 +244,20 @@ inline int32_t ReadUseSimt(gert::TilingContext *context, Stage stage, bool isArc
     return (useSimtPtr != nullptr && *useSimtPtr != 0) ? 1 : 0;
 }
 
+/** q_global_offset：仅 Scatter attr3；其余阶段固定 0 */
+inline int32_t ReadQGlobalOffset(gert::TilingContext *context, Stage stage)
+{
+    if (stage != Stage::Scatter) {
+        return 0;
+    }
+    auto attrs = context->GetAttrs();
+    if (attrs == nullptr) {
+        return 0;
+    }
+    const int64_t *ptr = attrs->GetAttrPointer<int64_t>(3);
+    return (ptr != nullptr && *ptr != 0) ? 1 : 0;
+}
+
 inline int64_t UsedCoresForStage(Stage stage, int64_t numGroups, int64_t aivNum, int64_t totalRows, int64_t H)
 {
     switch (stage) {
@@ -287,6 +302,7 @@ inline ge::graphStatus FillTiling(gert::TilingContext *context, Stage stage)
     int64_t N = T * topk;
     bool isArch35 = k2q_csr_arch35::IsArch35Soc(socVersion);
     int32_t useSimt = ReadUseSimt(context, stage, isArch35);
+    int32_t qGlobalOffset = ReadQGlobalOffset(context, stage);
 
     int64_t numGroups = 1;
     int64_t qPerGroup = T > 0 ? T : 1;
@@ -296,6 +312,7 @@ inline ge::graphStatus FillTiling(gert::TilingContext *context, Stage stage)
         k2q_csr_arch35::FillMultiCoreGroups(T, aivNum, numGroups, qPerGroup);
     }
 
+    // 仅 SIMT Hist/Scatter 需为 DCache 预留 LocalMemory；MC/SIMD 不走 SIMT
     if (useSimt != 0 && (stage == Stage::Hist || stage == Stage::Scatter)) {
         if (ubSize > SIMT_DCACHE_BYTES) {
             (void)context->SetLocalMemorySize(static_cast<uint32_t>(ubSize - SIMT_DCACHE_BYTES));
@@ -342,12 +359,9 @@ inline ge::graphStatus FillTiling(gert::TilingContext *context, Stage stage)
     tiling->qPerGroup = static_cast<int32_t>(qPerGroup);
     tiling->reserved0 = static_cast<int32_t>(stage);
     tiling->useSimt = useSimt;
+    tiling->qGlobalOffset = qGlobalOffset;
 
-    // 仅 A5 SIMT Hist/Scatter 核内 SyncAll，需 batch 调度；A2/A5 MC 无 SyncAll
-    if (useSimt != 0 && (stage == Stage::Hist || stage == Stage::Scatter)) {
-        context->SetScheduleMode(1);
-    }
-
+    // Hist/Scatter 已无核内 SyncAll（-1 由 Host fill_）；保持默认调度以利多核重叠
     context->SetBlockDim(static_cast<uint32_t>(usedCores));
     return ge::GRAPH_SUCCESS;
 }
