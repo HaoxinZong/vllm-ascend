@@ -1033,6 +1033,7 @@ def _gqa_sparse_fwd_kernel(
             safe_page = tl.maximum(page, 0)
             pos = c + off_n
             pos_mask = (pos < seq_len) & valid_page
+            tail_or_invalid = (~valid_page) | (c + BLOCK_SIZE_K > seq_len)
             k = tl.load(
                 k_cache_ptr
                 + safe_page * stride_k_blk
@@ -1044,6 +1045,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 k = k.to(q.dtype)
+            if tail_or_invalid:
+                k = tl.where(pos_mask[None, :], k, 0.0)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
@@ -1068,6 +1071,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 v = v.to(q.dtype)
+            if tail_or_invalid:
+                v = tl.where(pos_mask[:, None], v, 0.0)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
             lse_next = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -1235,6 +1240,7 @@ def _gqa_sparse_decode_kernel(
         safe_page = tl.maximum(page, 0)
         pos = c + off_n
         pos_mask = (pos < kv_len) & valid_page
+        tail_or_invalid = (~valid_page) | (c + BLOCK_SIZE_K > kv_len)
         k = tl.load(
             k_cache_ptr
             + safe_page * stride_k_blk
@@ -1246,6 +1252,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             k = k.to(q.dtype)
+        if tail_or_invalid:
+            k = tl.where(pos_mask[None, :], k, 0.0)
         qk = tl.dot(q, k) * sm_scale_log2e
         qk = tl.where(pos_mask[None, :], qk, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -1266,6 +1274,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             v = v.to(q.dtype)
+        if tail_or_invalid:
+            v = tl.where(pos_mask[:, None], v, 0.0)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_next = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -1597,8 +1607,11 @@ def minimax_m3_index_decode(
 
     request_count = seq_lens.shape[0]
     assert total_query_tokens == request_count * decode_query_len
+    max_block_count = min(
+        triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE),
+        int(block_table.shape[-1]),
+    )
 
-    max_block_count = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     score_block_stride = round_up(
         max_block_count,
         SCORE_BLOCK_STRIDE_ALIGNMENT,
