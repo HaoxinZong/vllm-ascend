@@ -4979,6 +4979,12 @@ class NPUModelRunner(GPUModelRunner):
                             sliding_window=spec.sliding_window,
                             attention_chunk_size=spec.attention_chunk_size,
                         )
+                    elif (
+                        isinstance(attn_module, MiniMaxM3SparseAttention)
+                        and str(self.vllm_config.cache_config.cache_dtype) in ("fp8", "fp8_e4m3")
+                    ):
+                        assert isinstance(spec, FullAttentionSpec)
+                        spec = replace(spec, dtype=torch.float8_e4m3fn)
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 

@@ -2461,6 +2461,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
 
     ops.def(
+        "npu_sparse_attention_score(Tensor query, Tensor key, Tensor value,"
+        "                           Tensor select_idx, Tensor block_table,"
+        "                           int num_key_value_heads, float scale_value,"
+        "                           int block_size, int top_k, int inner_precise, *,"
+        "                           Tensor? select_num_idx=None, Tensor? actual_seq_lengths=None, Tensor? actual_seq_lengths_kv=None,"
+        "                           Tensor? q_dequant_scale=None, Tensor? k_dequant_scale=None, Tensor? v_dequant_scale=None,"
+        "                           ScalarType? attention_out_dtype=None) -> Tensor"
+    );
+    ops.impl("npu_sparse_attention_score", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attention_score);
+
+
+    ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"
         "                     Tensor[] scale1, Tensor[] scale2, Tensor[] bias1, Tensor[] bias2, Tensor probs, str group,"
         "                     int max_output_size, Tensor! out, Tensor! expert_token_nums, Tensor? x_active_mask=None, float swiglu_limit=1000000.0) -> (Tensor out, Tensor expert_token_nums)"
