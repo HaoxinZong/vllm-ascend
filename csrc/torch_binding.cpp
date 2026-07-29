@@ -2391,20 +2391,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_weight_nz_tensor_list);
 
     ops.def(
-        "npu_sparse_attention_score(Tensor query, Tensor key, Tensor value,"
-        "                           Tensor select_idx, Tensor block_table,"
-        "                           int num_key_value_heads, float scale_value,"
-        "                           int block_size, int top_k, int inner_precise, *,"
-        "                           Tensor? select_num_idx=None,"
-        "                           Tensor? actual_seq_lengths=None,"
-        "                           Tensor? actual_seq_lengths_kv=None,"
-        "                           Tensor? q_dequant_scale=None,"
-        "                           Tensor? k_dequant_scale=None,"
-        "                           Tensor? v_dequant_scale=None) -> Tensor"
-    );
-    ops.impl("npu_sparse_attention_score", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attention_score);
-
-    ops.def(
         "grouped_matmul_swiglu_quant_v2(Tensor x, Tensor[] weight, Tensor[] weight_scale, Tensor x_scale,  Tensor group_list,  Tensor? smooth_scale=None,"
         "                                                   Tensor[]? weight_assist_matrix=None, Tensor? bias=None, int? dequant_mode=0, int? dequant_dtype=0, int? quant_mode=0,"
         "                                                 int? quant_dtype=0, bool transpose_weight=False, int group_list_type=0, int[2] tuning_config=[],float swiglu_limit=0.0) ->"
