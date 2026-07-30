@@ -39,7 +39,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
@@ -52,6 +52,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -71,7 +72,6 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
     setup_ascend_local_comm_res,
-    vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -140,8 +140,6 @@ class NPUWorker(WorkerBase):
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
         self.profiler: TorchNPUProfilerWrapper | None = None
-        self.torch_reserved = 0
-        self.torch_allocated = 0
         self.npugraph_memory_bytes = 0
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
@@ -182,6 +180,7 @@ class NPUWorker(WorkerBase):
             logger.warning(
                 "Using blocking torch.distributed send/recv for PP activations."
             )
+        self._pp_send_work: list[Handle] = []
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
             # Prevent duplicate triggers, execute the exit logic only once
@@ -412,56 +411,53 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        if not vllm_version_is("0.23.0"):
-            # vLLM v0.24.0 (PR #45026) removed automatic per-process device
-            # isolation for DP workers. Mirror gpu_worker.py::init_device:
-            # shift self.local_rank by dp_local_rank * tp_pp_world_size so
-            # that each DP group binds to a distinct set of NPUs.
-            parallel_config = self.parallel_config
-            if (
-                parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
-                and parallel_config.data_parallel_backend != "ray"
-                and parallel_config.nnodes_within_dp == 1
-                # vllm-ascend: when the user pre-shards devices via
-                # --device-ids (which becomes assigned_physical_gpu_ids),
-                # each child process already binds to its own NPU(s); the
-                # DP local_rank shift below would push local_rank past the
-                # length of the per-rank device list and trip the assert
-                # in this same method. Skip the shift in that case.
-                and parallel_config.assigned_physical_gpu_ids is None
-            ):
-                dp_local_rank = parallel_config.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = parallel_config.data_parallel_index
-                tp_pp_world_size = parallel_config.pipeline_parallel_size * parallel_config.tensor_parallel_size
-                self.local_rank += dp_local_rank * tp_pp_world_size
+        # vLLM v0.24.0 (PR #45026) removed automatic per-process device
+        # isolation for DP workers. Mirror gpu_worker.py::init_device:
+        # shift self.local_rank by dp_local_rank * tp_pp_world_size so
+        # that each DP group binds to a distinct set of NPUs.
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.nnodes_within_dp == 1
+            # vllm-ascend: when the user pre-shards devices via
+            # --device-ids (which becomes assigned_physical_gpu_ids),
+            # each child process already binds to its own NPU(s); the
+            # DP local_rank shift below would push local_rank past the
+            # length of the per-rank device list and trip the assert
+            # in this same method. Skip the shift in that case.
+            and parallel_config.assigned_physical_gpu_ids is None
+        ):
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+            tp_pp_world_size = parallel_config.pipeline_parallel_size * parallel_config.tensor_parallel_size
+            self.local_rank += dp_local_rank * tp_pp_world_size
 
-            # Publish the logical-to-physical mapping for topology queries.
-            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
-            if assigned_physical_gpu_ids is not None:
-                from vllm.platforms.interface import set_assigned_physical_gpu_ids
+        # Publish the logical-to-physical mapping for topology queries.
+        assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
+        if assigned_physical_gpu_ids is not None:
+            from vllm.platforms.interface import set_assigned_physical_gpu_ids
 
-                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
-                assert self.local_rank < len(assigned_physical_gpu_ids), (
-                    f"local_rank {self.local_rank} is out of bounds for "
-                    f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
+            set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
+            assert self.local_rank < len(assigned_physical_gpu_ids), (
+                f"local_rank {self.local_rank} is out of bounds for "
+                f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
+            )
+            if parallel_config.distributed_executor_backend not in ("ray", "external_launcher"):
+                assert parallel_config.local_world_size <= len(assigned_physical_gpu_ids), (
+                    f"local_world_size ({parallel_config.local_world_size}) "
+                    f"exceeds assigned_physical_gpu_ids count "
+                    f"({len(assigned_physical_gpu_ids)})"
                 )
-                if parallel_config.distributed_executor_backend not in ("ray", "external_launcher"):
-                    assert parallel_config.local_world_size <= len(assigned_physical_gpu_ids), (
-                        f"local_world_size ({parallel_config.local_world_size}) "
-                        f"exceeds assigned_physical_gpu_ids count "
-                        f"({len(assigned_physical_gpu_ids)})"
-                    )
-            else:
-                visible_device_count = torch.npu.device_count() if torch.npu.is_available() else 0
-                assert self.local_rank < visible_device_count, (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds for {visible_device_count} devices."
-                )
-
-            visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
-            device = torch.device(f"{current_platform.device_type}:{visible_device_index}")
         else:
-            device = torch.device(f"npu:{self.local_rank}")
+            visible_device_count = torch.npu.device_count() if torch.npu.is_available() else 0
+            assert self.local_rank < visible_device_count, (
+                f"DP adjusted local rank {self.local_rank} is out of bounds for {visible_device_count} devices."
+            )
+
+        visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
+        device = torch.device(f"{current_platform.device_type}:{visible_device_index}")
 
         torch.npu.set_device(device)
 
@@ -481,10 +477,7 @@ class NPUWorker(WorkerBase):
             setup_ascend_local_comm_res(self.local_rank, self.vllm_config.kv_transfer_config)
 
         # take current memory snapshot
-        if vllm_version_is("0.23.0"):
-            self.init_snapshot = MemorySnapshot()
-        else:
-            self.init_snapshot = MemorySnapshot(device=device)
+        self.init_snapshot = MemorySnapshot(device=device)
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
         if self.init_snapshot.free_memory < self.requested_memory:
             GiB = lambda b: round(b / GiB_bytes, 2)
@@ -707,10 +700,14 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        self.profile_memory()
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
+
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -726,10 +723,14 @@ class NPUWorker(WorkerBase):
                     self._recv_pp_tensors_blocking()
                 )
             else:
-                intermediate_tensors = IntermediateTensors(
-                    get_pp_group().recv_tensor_dict(
-                        all_gather_group=all_gather_group
-                    )
+                tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
                 )
 
         if self.profiler is not None:
@@ -751,7 +752,7 @@ class NPUWorker(WorkerBase):
         if self._use_blocking_pp_p2p:
             self._send_pp_tensors_blocking(output.tensors)
         else:
-            get_pp_group().send_tensor_dict(
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=all_gather_group,
             )
@@ -790,19 +791,12 @@ class NPUWorker(WorkerBase):
                 WeightTransferEngineFactory,
             )
 
-            if vllm_version_is("0.23.0"):
-                self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
-                    self.vllm_config.weight_transfer_config,
-                    self.vllm_config.parallel_config,
-                    self.model_runner.get_model(),
-                )
-            else:
-                self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
-                    self.vllm_config.weight_transfer_config,
-                    self.vllm_config,
-                    self.device,
-                    self.model_runner.get_model(),
-                )
+            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                self.vllm_config.weight_transfer_config,
+                self.vllm_config,
+                self.device,
+                self.model_runner.get_model(),
+            )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.
@@ -867,7 +861,9 @@ class NPUWorker(WorkerBase):
                 f"memory, or `--kv-cache-memory={suggested_to_gpu_limit}` "
                 f"({format_gib(suggested_to_gpu_limit)} GiB) to fully utilize NPU "
                 f"free memory. Current KV cache memory: "
-                f"{format_gib(self.available_kv_cache_memory_bytes)} GiB."
+                f"{format_gib(self.available_kv_cache_memory_bytes)} GiB. "
+                f"After warmup: torch reserved memory {format_gib(torch.npu.memory_reserved())} GiB, "
+                f"torch allocated memory {format_gib(torch.npu.memory_allocated())} GiB."
             )
             logger.info(msg)
 
@@ -882,6 +878,7 @@ class NPUWorker(WorkerBase):
                 bind_cpus(self.local_rank)
             except Exception as e:
                 logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -1084,8 +1081,8 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
-        self.profile_memory()
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

@@ -45,7 +45,7 @@ class MemcacheBackend(Backend):
             self.store = self._setup_store()
             self._store_initialized = True
 
-    def _ensure_initialized(self):
+    def ensure_initialized(self):
         if self._store_initialized:
             return
 
@@ -150,6 +150,10 @@ class MemcacheBackend(Backend):
         assert self.store is not None
         return self.store.batch_remove_lease(keys)
 
+    def batch_write_finish(self, keys: list[str], results: list[int]) -> list[int]:
+        assert self.store is not None
+        return self.store.batch_write_finish(keys, results)
+
     def get(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
             logger.error(
@@ -177,22 +181,19 @@ class MemcacheBackend(Backend):
             return res
         except Exception as e:
             logger.error(
-                "Failed to get %d keys out of %d. Check store state and network.",
+                "Failed to get %d keys out of %d. type=%s, error=%s. Check store state and network.",
                 len(key),
                 len(key),
-            )
-            logger.debug(
-                "Failed to get key details. keys=%s, type=%s, error=%s",
-                key,
                 type(e).__name__,
                 e,
             )
+            logger.debug("Failed to get key details. keys=%s", key)
             return None
 
     def put(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
+        self.ensure_initialized()
+        assert self.store is not None
         try:
-            self._ensure_initialized()
-            assert self.store is not None
             res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
@@ -209,15 +210,12 @@ class MemcacheBackend(Backend):
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
             logger.error(
-                "Failed to put %d keys out of %d. Check store state and memory.",
+                "Failed to put %d keys out of %d. type=%s, error=%s. Check store state and memory.",
                 len(key),
                 len(key),
-            )
-            logger.debug(
-                "Failed to put key details. keys=%s, type=%s, error=%s",
-                key,
                 type(e).__name__,
                 e,
             )
+            logger.debug("Failed to put key details. keys=%s", key)
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
