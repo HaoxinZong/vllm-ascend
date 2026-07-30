@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 
 from tests.ut.base import TestBase
@@ -124,6 +125,32 @@ class TestAscendModelSlimConfig(TestBase):
             self.assertIs(method, None)
             method = self.ascend_config.get_quant_method(attention_layer, "layers.1.attn")
             self.assertIs(method, mock_ascend_kvcache.return_value)
+
+    def test_native_mxfp8_uses_current_routed_experts_api(self):
+        config = AscendModelSlimConfig({"quant_method": "mxfp8"})
+        layer = RoutedExperts.__new__(RoutedExperts)
+        torch.nn.Module.__init__(layer)
+        layer.moe_config = MagicMock()
+
+        with (
+            patch(
+                "vllm_ascend.quantization.methods.w8a8_mxfp8.AscendW8A8MXFP8DynamicFusedMoEMethod"
+            ) as mock_scheme,
+            patch(
+                "vllm_ascend.quantization.method_adapters.AscendFusedMoEMethod"
+            ) as mock_adapter,
+        ):
+            method = config.get_quant_method(
+                layer,
+                "model.layers.0.mlp.experts",
+            )
+
+        self.assertIs(method, mock_adapter.return_value)
+        mock_adapter.assert_called_once_with(
+            mock_scheme.return_value,
+            layer.moe_config,
+            None,
+        )
 
     def test_get_quant_method_for_c8_kv_cache_attention(self):
         c8_config = AscendModelSlimConfig(

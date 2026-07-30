@@ -374,7 +374,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         elif quant_type in (QuantType.W8A8MXFP, QuantType.W4A8MXFP):
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
                 hidden_states,
-                dst_type=torch.float8_e4m3fn,scale_alg=1
+                dst_type=torch.float8_e4m3fn,
+                scale_alg=1,
             )
         elif quant_type == QuantType.W4A4MXFP:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(

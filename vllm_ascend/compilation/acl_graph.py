@@ -295,8 +295,7 @@ def update_full_graph_params(
             num_tokens,
             vllm_config,
             speculative_config,
-            num_dcp_pcp_tokens,
-            draft_attn_metadatas,
+            draft_attn_metadatas=draft_attn_metadatas,
         )
 
         from vllm_ascend.ops.gdn import update_conv1d_graph_params

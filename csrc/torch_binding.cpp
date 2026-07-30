@@ -40,7 +40,6 @@
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "attention/sparse_attention_score_prefill/sparse_attention_score_prefill_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
-#include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"

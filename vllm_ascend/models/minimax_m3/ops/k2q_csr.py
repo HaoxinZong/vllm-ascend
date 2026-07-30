@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Python entry for AscendC ``npu_k2q_csr`` (q2k -> k2q CSR).
+"""A5 entry for AscendC ``npu_k2q_csr`` (q2k -> k2q CSR).
 
 Wraps the compiled custom op registered as ``torch.ops._C_ascend.npu_k2q_csr``.
 Requires ``enable_custom_op()`` (or an import of ``vllm_ascend.vllm_ascend_C``)

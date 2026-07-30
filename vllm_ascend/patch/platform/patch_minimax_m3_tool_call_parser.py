@@ -247,19 +247,20 @@ def _normalize_to_json(
             if child_type == "array" and len(values) == 1 and isinstance(values[0], list):
                 result[key] = values[0]
             elif child_type == "array":
-                # Array items might be wrapped in a named element
-                items_schema = child_config.get("items", {})
-                if isinstance(items_schema, dict) and items_schema.get("type") == "object":
-                    result[key] = values
-                elif child_type == "array":
-                    result[key] = values
-                else:
-                    result[key] = values
+                result[key] = values
             else:
                 result[key] = values
-        elif child_type == "object" and len(values) == 1 and isinstance(values[0], dict):
-            result[key] = values[0]
-        elif isinstance(child_config, dict) and "properties" in child_config and len(values) == 1 and isinstance(values[0], dict):
+        elif (
+            (
+                child_type == "object"
+                or (
+                    isinstance(child_config, dict)
+                    and "properties" in child_config
+                )
+            )
+            and len(values) == 1
+            and isinstance(values[0], dict)
+        ):
             result[key] = values[0]
         else:
             # For unknown structs or scalar values
@@ -586,9 +587,10 @@ class MinimaxM3ToolParser(ToolParser):
         """Detect if a new tool-call block started since previous_text."""
         if not previous_text:
             return _TOOL_CALL_START in current_text
-        if _TOOL_CALL_START not in previous_text and _TOOL_CALL_START in current_text:
-            return True
-        return False
+        return (
+            _TOOL_CALL_START not in previous_text
+            and _TOOL_CALL_START in current_text
+        )
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""

@@ -650,6 +650,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         pertoken_scale = prepare_output.pertoken_scale
 
         # Matrix multiply.
+        activation = self.activation
+        if getattr(self.routed_experts, "swigluoai_uninterleave", False):
+            activation = "swigluoai_uninterleave"
+
         # apply() expects a RoutedExperts-like layer for weight access
         # (w13_weight, w2_weight, swiglu_limit, etc.). Pass routed_experts,
         # not self; the routing params come through the other kwargs.
@@ -669,7 +673,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             scoring_func=self.scoring_func,
             routed_scaling_factor=self._original_routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
+            activation=activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,

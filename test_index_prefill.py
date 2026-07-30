@@ -1,10 +1,9 @@
 import torch
 
-from vllm_ascend.attention.msa_m3_triton import (
-     minimax_m3_index_score,
-     minimax_m3_index_topk,
-  )
-
+from vllm_ascend.models.minimax_m3.ops.msa_m3_triton import (
+    minimax_m3_index_score,
+    minimax_m3_index_topk,
+)
 
 BLOCK_SIZE = 128
 DEVICE = "npu"

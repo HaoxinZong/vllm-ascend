@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.fused_moe.moe_mlp import (
+    _swiglu_mx_quant,
     cumsum_group_list,
     quant_apply_mlp,
     unified_apply_mlp,
@@ -666,6 +667,99 @@ class TestQuantApplyMlpNoGeluImpact(_GeluPathBase):
 
 
 class TestMiniMaxSwiGluOAIPath(_GeluPathBase):
+    def test_mxfp8_uses_fused_swiglu_mx_quant_when_available(self):
+        hidden_states = torch.randn(2, 8)
+        quantized = torch.randn(2, 4)
+        scale = torch.randn(2, 1)
+        normalized_scale = torch.randn(2, 1)
+
+        with (
+            patch(
+                "torch_npu.npu_swiglu_mx_quant",
+                return_value=(quantized, scale),
+                create=True,
+            ) as mock_swiglu_mx_quant,
+            patch.object(
+                DeviceOperator,
+                "maybe_normalize_mxfp_scale_layout",
+                return_value=normalized_scale,
+            ) as mock_normalize,
+        ):
+            actual, actual_scale = _swiglu_mx_quant(
+                hidden_states,
+                act_quant_type=torch.float8_e4m3fn,
+                swiglu_limit=7.0,
+                swiglu_alpha=1.702,
+                swiglu_beta=1.0,
+            )
+
+        self.assertTrue(actual is quantized)
+        self.assertTrue(actual_scale is normalized_scale)
+        mock_swiglu_mx_quant.assert_called_once_with(
+            hidden_states,
+            group_index=None,
+            dst_type=torch.float8_e4m3fn,
+            activate_dim=-1,
+            activate_left=True,
+            swiglu_mode=1,
+            clamp_limit=7.0,
+            glu_alpha=1.702,
+            glu_bias=1.0,
+            group_mode=0,
+            axis=-1,
+            round_mode="rint",
+            scale_alg=1,
+            max_dtype_value=0.0,
+        )
+        mock_normalize.assert_called_once_with(scale)
+
+    def test_mxfp8_falls_back_to_a5_activation_and_dynamic_quant(self):
+        hidden_states = torch.randn(2, 8)
+        quantized = torch.randn(2, 4)
+        scale = torch.randn(2, 1)
+        normalized_scale = torch.randn(2, 1)
+        gate = hidden_states[..., :4].clamp(max=7.0)
+        up = hidden_states[..., 4:].clamp(min=-7.0, max=7.0)
+        expected_activation = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+
+        with (
+            patch(f"{MOE_MLP}.ASCEND_DEVICE_TYPE", AscendDeviceType.A5),
+            patch("torch_npu.npu_swiglu_mx_quant", None, create=True),
+            patch(
+                "torch_npu.npu_dynamic_mx_quant",
+                return_value=(quantized, scale),
+                create=True,
+            ) as mock_dynamic_mx_quant,
+            patch(
+                "torch_npu.npu_clipped_swiglu",
+                create=True,
+            ) as mock_clipped_swiglu,
+            patch.object(
+                DeviceOperator,
+                "maybe_normalize_mxfp_scale_layout",
+                return_value=normalized_scale,
+            ) as mock_normalize,
+        ):
+            actual, actual_scale = _swiglu_mx_quant(
+                hidden_states,
+                act_quant_type=torch.float8_e4m3fn,
+                swiglu_limit=7.0,
+                swiglu_alpha=1.702,
+                swiglu_beta=1.0,
+            )
+
+        self.assertTrue(actual is quantized)
+        self.assertTrue(actual_scale is normalized_scale)
+        dynamic_quant_call = mock_dynamic_mx_quant.call_args
+        torch.testing.assert_close(
+            dynamic_quant_call.args[0],
+            expected_activation,
+        )
+        self.assertEqual(dynamic_quant_call.kwargs["dst_type"], torch.float8_e4m3fn)
+        self.assertEqual(dynamic_quant_call.kwargs["scale_alg"], 1)
+        mock_clipped_swiglu.assert_not_called()
+        mock_normalize.assert_called_once_with(scale)
+
     def test_w8a8_uses_uninterleaved_clipped_swiglu(self):
         gate_up = torch.randn(1, 8)
         activated = torch.randn(1, 4)

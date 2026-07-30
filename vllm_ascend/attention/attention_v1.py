@@ -63,9 +63,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
-from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.scatter_pa_kv_cache_with_k_scale import scatter_pa_kv_cache_with_k_scale
-from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 from vllm_ascend.utils import is_950, weak_ref_tensors
 
 # default max value of sliding window size
@@ -1660,7 +1658,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return output
         if self.k_scale_cache is not None:
             return self._forward_fia_fp8(query, attn_metadata, output)
-        passed_key = key
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache

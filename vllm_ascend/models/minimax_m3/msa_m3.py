@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+import torch_npu
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -39,6 +40,12 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.models.minimax_m3.ops.msa_m3_npu import minimax_m3_sparse_attn
+from vllm_ascend.models.minimax_m3.ops.msa_m3_npu_a5 import (
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_a5_pp8,
+)
+from vllm_ascend.models.minimax_m3.ops.msa_m3_npu_a5 import (
+    minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_a5,
+)
 from vllm_ascend.models.minimax_m3.ops.msa_m3_triton import (
     minimax_m3_index_decode,
     minimax_m3_index_score,
@@ -47,6 +54,60 @@ from vllm_ascend.models.minimax_m3.ops.msa_m3_triton import (
 )
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+_SPARSE_ATTN_A5_PP_SIZE = 8
+
+
+def _resolve_indexer_kv_dtype(vllm_config: VllmConfig) -> str:
+    """Resolve the optional A5 indexer-cache dtype."""
+    attention_config = getattr(vllm_config, "attention_config", None)
+    dtype = (
+        getattr(attention_config, "indexer_kv_dtype", None)
+        if attention_config is not None
+        else None
+    )
+    if dtype is None:
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        dtype = additional_config.get("indexer_kv_dtype", "bf16")
+    return str(dtype)
+
+
+def _as_index_triton_kv_cache(
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> torch.Tensor:
+    if isinstance(index_kv_cache, (tuple, list)):
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 5 and index_kv_cache.shape[0] == 2:
+        index_kv_cache = index_kv_cache[0]
+    if index_kv_cache.ndim == 4:
+        if index_kv_cache.shape[2] != 1:
+            raise ValueError(
+                f"Unexpected index cache shape: {tuple(index_kv_cache.shape)}"
+            )
+        index_kv_cache = index_kv_cache.squeeze(2)
+    if index_kv_cache.ndim != 3:
+        raise ValueError(f"Unexpected index cache ndim: {index_kv_cache.ndim}")
+    return index_kv_cache
+
+
+def _scatter_index_cache(
+    cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+    updates: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    cache = _as_index_triton_kv_cache(cache)
+    slots = slot_mapping.reshape(-1)
+    if slots.numel() == 0:
+        return
+    updates = updates.reshape(slots.shape[0], cache.shape[-1]).to(cache.dtype)
+    pa_cache = cache.unsqueeze(2)
+    key = updates.reshape(slots.shape[0], 1, cache.shape[-1]).contiguous()
+    torch_npu.npu_scatter_pa_cache(
+        key,
+        slots.contiguous(),
+        key_cache=pa_cache,
+    )
 
 
 def _active_decode_num_reqs(
@@ -146,11 +207,25 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         prefix: str,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
-        self.dtype = torch.bfloat16
+        if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+            if get_ascend_device_type() != AscendDeviceType.A5:
+                raise NotImplementedError(
+                    "FP8 MiniMax-M3 indexer cache is only supported on A5."
+                )
+            self.dtype = torch.float8_e4m3fn
+        elif indexer_kv_dtype == "bf16":
+            self.dtype = torch.bfloat16
+        else:
+            raise NotImplementedError(
+                f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported "
+                "(only 'bf16' or 'fp8'/'fp8_e4m3')."
+            )
+        self.indexer_kv_dtype = indexer_kv_dtype
         self.prefix = prefix
         self.cache_config = cache_config
         compilation_config = get_current_vllm_config().compilation_config
@@ -308,6 +383,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         init_blocks: int = 0,
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -322,6 +398,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
             cache_config=cache_config,
+            indexer_kv_dtype=indexer_kv_dtype,
         )
 
     def forward(
@@ -336,7 +413,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         num_tokens = index_md.num_actual_tokens
         num_decode_tokens = index_md.num_decode_tokens
         iq = index_query[:num_tokens].view(-1, self.num_index_heads, self.index_head_dim)
-        kv = self.index_cache.kv_cache
+        kv = _as_index_triton_kv_cache(self.index_cache.kv_cache)
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
@@ -397,6 +474,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
         init_blocks: int = 0,
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.impl = AscendMiniMaxM3IndexerImpl(
@@ -410,6 +488,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             cache_config=cache_config,
+            indexer_kv_dtype=indexer_kv_dtype,
         )
 
     @property
@@ -623,6 +702,15 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         self.kv_cache_dtype = kv_cache_dtype
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
+        self.use_a5_sparse_ops = (
+            get_ascend_device_type() == AscendDeviceType.A5
+        )
+        parallel_config = get_current_vllm_config().parallel_config
+        self.use_a5_pp8_prefill = (
+            self.use_a5_sparse_ops
+            and parallel_config.pipeline_parallel_size
+            == _SPARSE_ATTN_A5_PP_SIZE
+        )
 
     def forward(
         self,
@@ -648,22 +736,41 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
-            minimax_m3_sparse_attn_decode(
-                q[:num_decode_tokens],
-                kv_cache,
-                decode_topk,
-                d.block_table,
-                d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
-                out[:num_decode_tokens],
-                d.decode_query_len,
-            )
+            if self.use_a5_sparse_ops:
+                minimax_m3_sparse_attn_decode_a5(
+                    q[:num_decode_tokens],
+                    kv_cache,
+                    decode_topk,
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:num_decode_tokens],
+                    d.decode_query_len,
+                    block_size=self.block_size,
+                )
+            else:
+                minimax_m3_sparse_attn_decode(
+                    q[:num_decode_tokens],
+                    kv_cache,
+                    decode_topk,
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:num_decode_tokens],
+                    d.decode_query_len,
+                )
 
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            minimax_m3_sparse_attn(
+            prefill_fn = (
+                minimax_m3_sparse_attn_a5_pp8
+                if self.use_a5_pp8_prefill
+                else minimax_m3_sparse_attn
+            )
+            prefill_fn(
                 q[num_decode_tokens:],
                 kv_cache,
                 prefill_topk,

@@ -31,6 +31,7 @@ from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAn
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
+    AscendDeviceType,
     dispose_tensor,
     enable_custom_op,
     get_ascend_device_type,
@@ -94,6 +95,82 @@ def _require_single_tensor_for_swiglu_quant(
             raise ValueError(f"{name} must be a tensor or a single-element list, but got {len(tensor_or_list)}.")
         return tensor_or_list[0]
     return tensor_or_list
+
+
+def _as_tensor_list(
+    tensor_or_list: list[torch.Tensor] | torch.Tensor | None,
+) -> list[torch.Tensor] | None:
+    if tensor_or_list is None:
+        return None
+    if isinstance(tensor_or_list, list):
+        return tensor_or_list
+    return [tensor_or_list]
+
+
+def _apply_clipped_swiglu(
+    hidden_states: torch.Tensor,
+    *,
+    swiglu_limit: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+) -> torch.Tensor:
+    if ASCEND_DEVICE_TYPE == AscendDeviceType.A5:
+        hidden_size = hidden_states.shape[-1] // 2
+        gate = hidden_states[..., :hidden_size].clamp(max=swiglu_limit)
+        up = hidden_states[..., hidden_size:].clamp(
+            min=-swiglu_limit,
+            max=swiglu_limit,
+        )
+        return gate * torch.sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)
+
+    return torch_npu.npu_clipped_swiglu(
+        hidden_states,
+        interleaved=False,
+        alpha=swiglu_alpha,
+        limit=swiglu_limit,
+        bias=swiglu_beta,
+    )
+
+
+def _swiglu_mx_quant(
+    hidden_states: torch.Tensor,
+    *,
+    act_quant_type: torch.dtype,
+    swiglu_limit: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    swiglu_mx_quant = getattr(torch_npu, "npu_swiglu_mx_quant", None)
+    if swiglu_mx_quant is None:
+        hidden_states = _apply_clipped_swiglu(
+            hidden_states,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+            hidden_states,
+            dst_type=act_quant_type,
+            scale_alg=1,
+        )
+    else:
+        hidden_states, swiglu_out_scale = swiglu_mx_quant(
+            hidden_states,
+            group_index=None,
+            dst_type=act_quant_type,
+            activate_dim=-1,
+            activate_left=True,
+            swiglu_mode=1,
+            clamp_limit=swiglu_limit,
+            glu_alpha=swiglu_alpha,
+            glu_bias=swiglu_beta,
+            group_mode=0,
+            axis=-1,
+            round_mode="rint",
+            scale_alg=1,
+            max_dtype_value=0.0,
+        )
+    return hidden_states, DeviceOperator.maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
 
 
 def quant_apply_mlp(
@@ -200,6 +277,32 @@ def quant_apply_mlp(
             )
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
+        elif use_mxfp_quant and is_swigluoai_uninterleave:
+            if FLOAT8_E8M0FNU_DTYPE is None:
+                raise RuntimeError("MXFP MoE MLP path requires float8_e8m0fnu scale dtype.")
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=_as_tensor_list(w1),
+                scale=_as_tensor_list(w1_scale),
+                bias=None,
+                per_token_scale=[pertoken_scale],
+                split_item=2,
+                group_list_type=group_list_type,
+                group_type=0,
+                group_list=group_list,
+                output_dtype=torch.bfloat16,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+            )[0]
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+            hidden_states, swiglu_out_scale = _swiglu_mx_quant(
+                hidden_states,
+                act_quant_type=act_quant_type,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            )
         elif activation == MoEActivation.SWIGLUSTEP:
             # Step3.5/3.7 needs to clamp in swiglu: out = silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
             gmm1_kwargs = {
@@ -304,12 +407,11 @@ def quant_apply_mlp(
             approximate = "tanh" if activation == MoEActivation.GELU_TANH else "none"
             hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
         elif is_swigluoai_uninterleave:
-            hidden_states = torch_npu.npu_clipped_swiglu(
+            hidden_states = _apply_clipped_swiglu(
                 hidden_states,
-                interleaved=False,
-                alpha=swiglu_alpha,
-                limit=swiglu_limit,
-                bias=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
         else:
             hidden_states = torch_npu.npu_swiglu(hidden_states)
@@ -387,26 +489,34 @@ def quant_apply_mlp(
                 dispose_tensor(quantized_hidden_states)
         else:
             # gmm1: gate_up_proj
-            gmm1_kwargs = {
-                "x": [hidden_states],
-                "weight": w1 if isinstance(w1, list) else [w1],
-                "scale": [w1_scale[0].to(w2_scale[0].dtype)] if isinstance(w1_scale, list) else [w1_scale],
-                "bias": bias1,
-                "per_token_scale": [pertoken_scale],
-                "split_item": 2,
-                "group_type": 0,
-                "group_list": group_list,
-                "group_list_type": group_list_type,
-                "output_dtype": _output_dtype,
-            }
             if use_mxfp_quant:
-                gmm1_kwargs.update(
-                    {
-                        "scale_dtype": FLOAT8_E8M0FNU_DTYPE,
-                        "per_token_scale_dtype": FLOAT8_E8M0FNU_DTYPE,
-                        "output_dtype": torch.bfloat16,
-                    }
-                )
+                gmm1_kwargs = {
+                    "x": [hidden_states],
+                    "weight": _as_tensor_list(w1),
+                    "scale": _as_tensor_list(w1_scale),
+                    "bias": _as_tensor_list(bias1),
+                    "per_token_scale": [pertoken_scale],
+                    "split_item": 2,
+                    "group_type": 0,
+                    "group_list": group_list,
+                    "group_list_type": group_list_type,
+                    "output_dtype": torch.bfloat16,
+                    "scale_dtype": FLOAT8_E8M0FNU_DTYPE,
+                    "per_token_scale_dtype": FLOAT8_E8M0FNU_DTYPE,
+                }
+            else:
+                gmm1_kwargs = {
+                    "x": [hidden_states],
+                    "weight": w1 if isinstance(w1, list) else [w1],
+                    "scale": [w1_scale[0].to(w2_scale[0].dtype)] if isinstance(w1_scale, list) else [w1_scale],
+                    "bias": bias1,
+                    "per_token_scale": [pertoken_scale],
+                    "split_item": 2,
+                    "group_type": 0,
+                    "group_list": group_list,
+                    "group_list_type": group_list_type,
+                    "output_dtype": _output_dtype,
+                }
             hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
@@ -422,16 +532,26 @@ def quant_apply_mlp(
                 hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
             elif is_swigluoai_uninterleave:
-                hidden_states = torch_npu.npu_clipped_swiglu(
-                    hidden_states,
-                    interleaved=False,
-                    alpha=swiglu_alpha,
-                    limit=swiglu_limit,
-                    bias=swiglu_beta,
-                )
-                hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
-                    hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
-                )
+                if use_mxfp_quant:
+                    hidden_states, swiglu_out_scale = _swiglu_mx_quant(
+                        hidden_states,
+                        act_quant_type=act_quant_type,
+                        swiglu_limit=swiglu_limit,
+                        swiglu_alpha=swiglu_alpha,
+                        swiglu_beta=swiglu_beta,
+                    )
+                else:
+                    hidden_states = _apply_clipped_swiglu(
+                        hidden_states,
+                        swiglu_limit=swiglu_limit,
+                        swiglu_alpha=swiglu_alpha,
+                        swiglu_beta=swiglu_beta,
+                    )
+                    hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+                        hidden_states,
+                        act_quant_type=act_quant_type,
+                        use_mxfp_quant=False,
+                    )
             elif HAS_TRITON:
                 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
@@ -539,12 +659,11 @@ def unquant_apply_mlp(
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     elif act_name == "swigluoai_uninterleave":
-        gate_up_out = torch_npu.npu_clipped_swiglu(
+        gate_up_out = _apply_clipped_swiglu(
             gate_up_out,
-            interleaved=False,
-            alpha=swiglu_alpha,
-            limit=swiglu_limit,
-            bias=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
     elif activation == MoEActivation.SWIGLUSTEP:
         gate_up_out = AscendSwigluStepAndMul.swiglustep_forward(gate_up_out, limit=swiglu_limit or 7.0)

@@ -28,6 +28,7 @@ from itertools import islice
 from typing import Any
 
 import torch
+import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -94,8 +95,11 @@ from vllm_ascend.models.minimax_m3.msa_m3 import (
     AscendMiniMaxM3SparseImpl,
     AscendMiniMaxM3SparseMetadata,
     _register_m3_sparse_packed_modules,
+    _resolve_indexer_kv_dtype,
+    _scatter_index_cache,
     _use_fused_qkv_indexer,
 )
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
@@ -207,6 +211,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
+        self.indexer_kv_dtype = _resolve_indexer_kv_dtype(vllm_config)
         self.kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
         self.attn_backend = AscendMiniMaxM3SparseBackend
@@ -232,6 +237,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             init_blocks=sparse_cfg.get("sparse_init_block", 0),
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -281,17 +287,22 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             main_meta.slot_mapping[:num_tokens],
         )
 
-        idx_cache = self.indexer.index_cache.kv_cache
-        if isinstance(idx_cache, (tuple, list)):
-            idx_cache = idx_cache[0]
-        flat = idx_cache.view(-1, self.idx_head_dim)
-        # Scatter ND update ignores indices outside the cache bounds, so graph
-        # padding slots set to -1 do not write into the last cache row.
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(
-            flat,
-            index_meta.slot_mapping[:num_tokens].view(-1, 1),
-            index_key[:num_tokens].to(flat.dtype),
-        )
+        if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+            _scatter_index_cache(
+                self.indexer.index_cache.kv_cache,
+                index_key[:num_tokens],
+                index_meta.slot_mapping[:num_tokens],
+            )
+        else:
+            idx_cache = self.indexer.index_cache.kv_cache
+            if isinstance(idx_cache, (tuple, list)):
+                idx_cache = idx_cache[0]
+            flat = idx_cache.view(-1, self.idx_head_dim)
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                flat,
+                index_meta.slot_mapping[:num_tokens].view(-1, 1),
+                index_key[:num_tokens].to(flat.dtype),
+            )
 
     def _sparse_prepare(
         self,
@@ -342,7 +353,15 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
 
         index_q, index_k = self._index_qk_norm(index_q, index_k)
-        index_q, index_k = self.rotary_emb(positions, index_q, index_k)
+        if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+            index_q, index_k = self.rotary_emb(
+                positions,
+                index_q,
+                index_k,
+                out_dtype=torch.float8_e4m3fn,
+            )
+        else:
+            index_q, index_k = self.rotary_emb(positions, index_q, index_k)
 
         return q, k, v, index_q, index_k
 
@@ -357,6 +376,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Insert KV, build sparse top-k indices, then run sparse attention."""
         self._insert_kv(key, value, index_key)
+        if (
+            get_ascend_device_type() == AscendDeviceType.A5
+            and not get_forward_context().capturing
+        ):
+            torch.npu.current_stream().synchronize()
         topk_idx = self.indexer(index_query)
         self.impl.forward(self, query, self.kv_cache, topk_idx, attn_output)
 
@@ -432,16 +456,82 @@ def _get_rope_parameters(config: PretrainedConfig) -> dict[str, Any] | None:
     return rope_parameters
 
 
+def _is_w8a8_mxfp8_linear(layer: nn.Module) -> bool:
+    quant_method = getattr(layer, "quant_method", None)
+    quant_scheme = getattr(quant_method, "quant_method", quant_method)
+    return (
+        quant_scheme is not None
+        and quant_scheme.__class__.__name__
+        == "AscendW8A8MXFP8DynamicLinearMethod"
+    )
+
+
 class MiniMaxM3SwiGLUOAI(nn.Module):
     """MiniMax-M3 SwiGLU-OAI activation for packed gate/up outputs."""
 
-    def __init__(self, alpha: float, beta: float, limit: float):
+    def __init__(
+        self,
+        alpha: float,
+        beta: float,
+        limit: float,
+        use_mx_quant: bool = False,
+    ):
         super().__init__()
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.limit = float(limit)
+        self.use_mx_quant = use_mx_quant
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.use_mx_quant:
+            swiglu_mx_quant = getattr(torch_npu, "npu_swiglu_mx_quant", None)
+            if swiglu_mx_quant is None:
+                d = x.shape[-1] // 2
+                gate = torch.clamp(x[..., :d], max=self.limit)
+                up = torch.clamp(
+                    x[..., d:],
+                    min=-self.limit,
+                    max=self.limit,
+                )
+                activated = (
+                    gate
+                    * torch.sigmoid(self.alpha * gate)
+                    * (up + self.beta)
+                )
+                quantized_x, scale = torch_npu.npu_dynamic_mx_quant(
+                    activated,
+                    dst_type=torch.float8_e4m3fn,
+                    scale_alg=1,
+                )
+            else:
+                quantized_x, scale = swiglu_mx_quant(
+                    x,
+                    group_index=None,
+                    dst_type=torch.float8_e4m3fn,
+                    activate_dim=-1,
+                    activate_left=True,
+                    swiglu_mode=1,
+                    clamp_limit=self.limit,
+                    glu_alpha=self.alpha,
+                    glu_bias=self.beta,
+                    group_mode=0,
+                    axis=-1,
+                    round_mode="rint",
+                    scale_alg=1,
+                    max_dtype_value=0.0,
+                )
+            from vllm_ascend.device.device_op import DeviceOperator
+
+            scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(scale)
+            assert scale is not None
+            return quantized_x, scale
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            d = x.shape[-1] // 2
+            gate = torch.clamp(x[..., :d], max=self.limit)
+            up = torch.clamp(x[..., d:], min=-self.limit, max=self.limit)
+            return gate * torch.sigmoid(self.alpha * gate) * (up + self.beta)
         return torch.ops.npu.npu_clipped_swiglu(
             x,
             dim=-1,
@@ -483,10 +573,20 @@ class MiniMaxM3MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act == "swigluoai":
+            use_mx_quant = (
+                get_ascend_device_type() == AscendDeviceType.A5
+                and _is_w8a8_mxfp8_linear(self.gate_up_proj)
+                and _is_w8a8_mxfp8_linear(self.down_proj)
+            )
+            if use_mx_quant:
+                logger.info_once(
+                    "Using swiglu_mx_quant for MiniMax-M3 W8A8-MXFP8 MLPs."
+                )
             self.act_fn = MiniMaxM3SwiGLUOAI(
                 alpha=config.swiglu_alpha,
                 beta=getattr(config, "swiglu_beta", 1.0),
                 limit=config.swiglu_limit,
+                use_mx_quant=use_mx_quant,
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}. Only swigluoai is supported.")
@@ -660,6 +760,10 @@ class MiniMaxM3Attention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+        )
+        # The A5 FP8 GQA path keeps a per-token K scale beside the K/V cache.
+        self.attn._ascend_minimax_m3_dense_gqa = (
+            get_ascend_device_type() == AscendDeviceType.A5
         )
 
     def _qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

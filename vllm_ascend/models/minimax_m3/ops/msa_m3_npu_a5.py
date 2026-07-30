@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import torch
+
+from vllm_ascend.models.minimax_m3.ops.k2q_csr import npu_k2q_csr
+
 _SPARSE_ATTN_INNER_PRECISE = 4
-from vllm_ascend.attention.k2q_csr import npu_k2q_csr
+
 
 def _split_main_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],

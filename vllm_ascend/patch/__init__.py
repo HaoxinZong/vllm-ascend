@@ -493,22 +493,6 @@
 #       Remove this patch once `torch.accelerator` correctly routes to the NPU
 #       backend for these memory APIs.
 #
-# ** 19. File: platform/patch_tool_choice_none_content.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionResponse`
-#      `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionStreamResponse`
-#    Why:
-#       vLLM v0.23.0 can serialize empty `tool_calls: []` fields for content-only
-#       OpenAI chat responses / streaming deltas, while OpenAI-compatible SDKs
-#       expect those empty fields to be omitted so clients see `tool_calls=None`.
-#    How：
-#       Wrap `model_dump` / `model_dump_json` for chat response payloads and drop
-#       empty `tool_calls` lists from `message` / `delta` objects.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/44105
-#    Future Plan:
-#       Remove this patch once the supported vLLM version contains PR #44105.
-#
 # ** 20. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
@@ -533,24 +517,6 @@
 #       runner and can rely on upstream's default enablement heuristics
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
-#
-# ** 12a. File: platform/patch_minimax_m2_tool_call_parser.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.tool_parsers.minimax_m2_tool_parser.MinimaxM2ToolParser`
-#    Why:
-#       vLLM 0.21.0 only emits MiniMax-M2 tool-call arguments after a complete
-#       `<invoke>...</invoke>` block, so long arguments are buffered instead of
-#       streamed incrementally.
-#    How:
-#       Monkey-patch the MiniMax-M2 parser to emit the tool name once the
-#       `<invoke name=...>` header is available and then stream partial
-#       `<parameter>` values as JSON argument fragments.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/40253
-#       https://github.com/vllm-project/vllm/pull/40298
-#    Future Plan:
-#       Remove this patch once the supported vLLM version contains the upstream
-#       MiniMax-M2 incremental tool-call streaming fix.
 #
 # ** 12c. File: platform/patch_minimax_m3_tool_call_parser.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

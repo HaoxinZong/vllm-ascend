@@ -11,9 +11,9 @@ _prefill_topk_invalid_index_mask_kernel.
 Per-iteration device-event timed (median over N iters).
 """
 import torch
-
 from vllm.triton_utils import tl, triton
-from vllm_ascend.attention.msa_m3_triton import (
+
+from vllm_ascend.models.minimax_m3.ops.msa_m3_triton import (
     SPARSE_BLOCK_SIZE,
     _choose_invalid_mask_query_tile_size,
     _topk_index_mask_invalid_prefill_kernel,
