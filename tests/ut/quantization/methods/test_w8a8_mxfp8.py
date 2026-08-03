@@ -149,21 +149,35 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         x = torch.randn(tokens, self.hidden_size, dtype=torch.bfloat16)
         router_logits = torch.randn(tokens, self.num_experts, dtype=torch.float32)
         topk_weights = torch.randn(tokens, 2)
-        topk_ids = torch.randint(0, self.num_experts, (tokens, 2))
+        topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int32)
         mock_select.return_value = (topk_weights, topk_ids)
         mock_comm = Mock()
         mock_comm.fused_experts.return_value = torch.randn(tokens, self.hidden_size)
         mock_ctx.moe_comm_method = mock_comm
         mock_ctx.moe_comm_type = Mock()
-        self.scheme.apply(
-            layer,
-            x,
-            router_logits,
-            top_k=2,
-            renormalize=True,
-            num_experts=self.num_experts,
-            activation="silu",
-            pertoken_scale=torch.randn(tokens),
-        )
+        original_randint = torch.randint
+        with patch(
+            "vllm_ascend.quantization.methods.w8a8_mxfp8.torch.randint",
+            wraps=original_randint,
+        ) as mock_randint:
+            self.scheme.apply(
+                layer,
+                x,
+                router_logits,
+                top_k=2,
+                renormalize=True,
+                num_experts=self.num_experts,
+                activation="silu",
+                pertoken_scale=torch.randn(tokens),
+            )
         mock_select.assert_called_once()
         mock_comm.fused_experts.assert_called_once()
+        mock_randint.assert_called_once_with(
+            low=0,
+            high=1_000_000,
+            size=(tokens, self.num_experts),
+            device=topk_ids.device,
+            dtype=torch.float32,
+        )
+        routed_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertTrue(routed_input.topk_ids.is_contiguous())

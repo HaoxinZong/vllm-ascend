@@ -369,10 +369,18 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         quant_type = token_dispatch_input.quant.quant_type
         dynamic_scale = token_dispatch_input.routing.pertoken_scale
         unquantized_mxfp4_dispatch = quant_type == QuantType.W4A4MXFP and dynamic_scale is None
-        # Without prepare-stage scales, MXFP4 stays unquantized in dispatch and
-        # is quantized again inside the MLP path.
+        unquantized_a5_mxfp8_dispatch = (
+            quant_type == QuantType.W8A8MXFP
+            and dynamic_scale is None
+            and get_ascend_device_type() == AscendDeviceType.A5
+        )
+        # Without prepare-stage scales, these modes stay unquantized in
+        # dispatch and are quantized again inside the MLP path. In particular,
+        # A5's MoeInitRoutingV3 MXFP8 fused-quant path can reject its generated
+        # output dtype/format before GMM1 executes.
+        deferred_mxfp_quantization = unquantized_mxfp4_dispatch or unquantized_a5_mxfp8_dispatch
         with_quant = token_dispatch_input.quant.dispatch_with_quant and quant_type != QuantType.W8A8FP
-        with_quant = with_quant and not unquantized_mxfp4_dispatch
+        with_quant = with_quant and not deferred_mxfp_quantization
         is_mxfp = token_dispatch_input.quant.is_mxfp
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
@@ -380,7 +388,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         expert_map = token_dispatch_input.routing.expert_map
         act_quant_type = (
             token_dispatch_input.quant.mxfp.act_quant_type
-            if token_dispatch_input.quant.mxfp is not None and not unquantized_mxfp4_dispatch
+            if token_dispatch_input.quant.mxfp is not None and not deferred_mxfp_quantization
             else None
         )
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
@@ -490,7 +498,15 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         token_dispatch_input: MoETokenDispatchInput,
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
-        with_quant = token_dispatch_input.quant.dispatch_with_quant
+        deferred_a5_mxfp8_quantization = (
+            token_dispatch_input.quant.quant_type == QuantType.W8A8MXFP
+            and get_ascend_device_type() == AscendDeviceType.A5
+        )
+        # MoeInitRoutingV3 rejects the FP8 token/scale pair produced by the
+        # AlltoAll profile path on some A5 CANN stacks. Keep communication and
+        # expert permutation in BF16, then use the existing MLP dynamic-MXFP8
+        # quantization immediately before GMM1.
+        with_quant = token_dispatch_input.quant.dispatch_with_quant and not deferred_a5_mxfp8_quantization
         dst_type = token_dispatch_input.quant.get_dst_type
         scale_type = token_dispatch_input.quant.get_scale_type
         hidden_states = token_dispatch_input.hidden_states

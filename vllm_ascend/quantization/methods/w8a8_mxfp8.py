@@ -298,8 +298,16 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
         if enable_force_load_balance:
-            random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
-            topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+            # Match the known-good v0.23 profile path. randint avoids the NPU
+            # graph/format issue seen when argsort consumes torch.rand output.
+            random_matrix = torch.randint(
+                low=0,
+                high=1_000_000,
+                size=(topk_ids.size(0), num_logical_experts),
+                device=topk_ids.device,
+                dtype=torch.float32,
+            )
+            topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype).contiguous()
 
         if x.dtype not in [torch.float8_e4m3fn]:
             topk_weights = topk_weights.to(x.dtype)

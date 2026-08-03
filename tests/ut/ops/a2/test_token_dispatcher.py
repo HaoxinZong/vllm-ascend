@@ -417,13 +417,23 @@ def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
         {
             "quant_type": QuantType.W8A8MXFP,
             "act_quant_type": torch.float8_e4m3fn,
+            "device_type": AscendDeviceType.A3,
             "expected_quant_mode": 3,
             "expected_act_quant_type": torch.float8_e4m3fn,
             "expect_dynamic_scale": True,
         },
         {
+            "quant_type": QuantType.W8A8MXFP,
+            "act_quant_type": torch.float8_e4m3fn,
+            "device_type": AscendDeviceType.A5,
+            "expected_quant_mode": -1,
+            "expected_act_quant_type": None,
+            "expect_dynamic_scale": False,
+        },
+        {
             "quant_type": QuantType.W4A4MXFP,
             "act_quant_type": MXFP4_TEST_DTYPE,
+            "device_type": AscendDeviceType.A5,
             "expected_quant_mode": -1,
             "expected_act_quant_type": None,
             "expect_dynamic_scale": False,
@@ -441,7 +451,10 @@ def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
         with patch(
             "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
             return_value=init_routing_output,
-        ) as mock_init_routing:
+        ) as mock_init_routing, patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_device_type",
+            return_value=case["device_type"],
+        ):
             output = dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
         init_kwargs = mock_init_routing.call_args.kwargs
@@ -728,6 +741,34 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.mock_repeat_interleave.return_value = torch.arange(16)
 
         self.dispatcher = TokenDispatcherWithAll2AllV(top_k=2, num_experts=4, num_local_experts=2, with_quant=False)
+
+    def test_a5_mxfp8_dispatch_defers_quantization_until_mlp(self):
+        dispatcher = TokenDispatcherWithAll2AllV(top_k=2, num_experts=4, num_local_experts=2)
+        hidden_states = torch.randn(8, 16, dtype=torch.bfloat16)
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=hidden_states,
+            topk_weights=torch.rand(8, 2),
+            topk_ids=torch.randint(0, 4, (8, 2), dtype=torch.int32),
+            quant_type=QuantType.W8A8MXFP,
+            act_quant_type=torch.float8_e4m3fn,
+        )
+        all_to_all_output = torch.randn(16, 16, dtype=torch.bfloat16)
+
+        with patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ), patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.async_all_to_all",
+            return_value=(None, all_to_all_output, MagicMock()),
+        ) as mock_all_to_all, patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_dynamic_quant",
+        ) as mock_dynamic_quant:
+            output = dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+        mock_dynamic_quant.assert_not_called()
+        self.mock_npu_moe_init_routing_v2.assert_not_called()
+        self.assertIsNone(output.dynamic_scale)
+        self.assertEqual(mock_all_to_all.call_args.args[0].dtype, torch.bfloat16)
 
     @pytest.mark.skip("Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
     def test_token_dispatch(self):
