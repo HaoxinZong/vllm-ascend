@@ -25,7 +25,12 @@ at::Tensor npu_sparse_attention_score_prefill(
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
 
-    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
+    // Prefill FP8 path always returns bf16 (full-quant, no attention_out_dtype arg).
+    at::ScalarType out_dtype = query.scalar_type();
+    if (query.scalar_type() == at::kFloat8_e4m3fn) {
+        out_dtype = at::kBFloat16;
+    }
+    at::Tensor output = at::empty(query.sizes(), query.options().dtype(out_dtype));
 
     EXEC_NPU_CMD(
         aclnnSparseAttentionScorePrefill,

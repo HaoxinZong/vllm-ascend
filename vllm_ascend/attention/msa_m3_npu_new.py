@@ -91,10 +91,14 @@ def minimax_m3_sparse_attn(
     k2q_slot_indices = k2q_slot_indices.to(dtype=torch.int32).contiguous()
     q_lens_t = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous()
     kv_lens_t = seq_lens.to(torch.int32).contiguous()
+    # Prefill FP8 is full-quant: clamp+cast Q/K/V, no dequant scales.
+    q_fp8 = _to_fp8(q)
+    key_fp8 = key if key.dtype == torch.float8_e4m3fn else _to_fp8(key)
+    value_fp8 = value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
     out = torch.ops._C_ascend.npu_sparse_attention_score_prefill(
-        q,
-        key,
-        value,
+        q_fp8,
+        key_fp8,
+        value_fp8,
         block_table,
         k2q_row_ptr,
         k2q_q_indices,

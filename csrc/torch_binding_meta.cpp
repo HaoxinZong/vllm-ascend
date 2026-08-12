@@ -409,8 +409,12 @@ at::Tensor npu_sparse_attention_score_prefill_meta(
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
-    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-    return output;
+    // Prefill FP8 path always returns bf16 (full-quant, no attention_out_dtype arg).
+    at::ScalarType out_dtype = query.scalar_type();
+    if (query.scalar_type() == at::kFloat8_e4m3fn) {
+        out_dtype = at::kBFloat16;
+    }
+    return at::empty(query.sizes(), query.options().dtype(out_dtype));
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_moe_init_routing_custom_meta(
