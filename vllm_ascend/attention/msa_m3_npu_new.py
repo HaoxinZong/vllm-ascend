@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
+
 _SPARSE_ATTN_INNER_PRECISE = 4
 FP8_E4M3_MAX = 448.0
+_SASA_PREFILL_DUMP_STEP = 0
 
 from vllm_ascend.attention.k2q_csr import npu_k2q_csr
+
 
 def _split_main_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
@@ -73,6 +77,7 @@ def minimax_m3_sparse_attn(
     sm_scale: float,
     output: torch.Tensor,
     block_size: int = 128,
+    layer_name: str | None = None,
 ) -> None:
     del prefix_lens, max_query_len
     key, value = _split_main_kv_cache(kv_cache)
@@ -95,6 +100,14 @@ def minimax_m3_sparse_attn(
     q_fp8 = _to_fp8(q)
     key_fp8 = key if key.dtype == torch.float8_e4m3fn else _to_fp8(key)
     value_fp8 = value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
+    # dump every hit: rank0 + MiniMax-M3 layer0
+    global _SASA_PREFILL_DUMP_STEP
+    rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+    if rank0 and layer_name and ".layers.0." in layer_name:
+        path = f"/tmp/m3_l0_r0_qk_fp8_{_SASA_PREFILL_DUMP_STEP}.pt"
+        torch.save({"q": q_fp8.cpu(), "k": key_fp8.cpu(), "layer_name": layer_name}, path)
+        _SASA_PREFILL_DUMP_STEP += 1
+        print(f"[sasa_prefill_dump] {path}", flush=True)
     out = torch.ops._C_ascend.npu_sparse_attention_score_prefill(
         q_fp8,
         key_fp8,

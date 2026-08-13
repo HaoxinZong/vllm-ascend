@@ -52,8 +52,9 @@ def minimax_m3_sparse_attn(
     sm_scale: float,
     output: torch.Tensor,
     block_size: int = 128,
+    layer_name: str | None = None,
 ) -> None:
-    del prefix_lens, max_query_len
+    del prefix_lens, max_query_len, layer_name
     key, value = _split_main_kv_cache(kv_cache)
     q_lens_t = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     q_fp8 = _to_fp8(q)
