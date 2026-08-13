@@ -51,11 +51,8 @@ from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
-from vllm_ascend.attention.msa_m3_npu import (
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_legacy,
-)
 from vllm_ascend.attention.msa_m3_npu_new import (
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_pp8,
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc,
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_ascendc,
 )
 from vllm_ascend.attention.msa_m3_ops import (
@@ -69,8 +66,6 @@ from vllm_ascend.ops.linear_op import get_parallel_op
 
 
 logger = init_logger(__name__)
-
-_SPARSE_ATTN_NEW_OP_PP_SIZE = 8
 
 _SPARSE_ATTN_LOGGED = False
 FP8_E4M3_MAX = 448.0
@@ -1037,17 +1032,8 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         self.kv_cache_dtype = kv_cache_dtype
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
-        try:
-            pp_size = (
-                get_current_vllm_config().parallel_config.pipeline_parallel_size
-            )
-        except Exception:
-            pp_size = 1
-        self.minimax_m3_sparse_attn_ascendc = (
-            minimax_m3_sparse_attn_ascendc_pp8
-            if pp_size == _SPARSE_ATTN_NEW_OP_PP_SIZE
-            else minimax_m3_sparse_attn_ascendc_legacy
-        )
+        # KV-gather-Q prefill op (npu_sparse_attention_score_prefill) for PP/TP/DP.
+        self.minimax_m3_sparse_attn_ascendc = minimax_m3_sparse_attn_ascendc
 
     def forward(
         self,
@@ -1178,6 +1164,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.scale,
                 out[nd:],
                 block_size=self.block_size,
+                layer_name=layer.layer_name,
             )
         return output
 
@@ -1514,17 +1501,22 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
-        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
+        # scatter_pa_kv_cache requires key/value dtype == cache dtype.
+        if key_cache.dtype == torch.float8_e4m3fn:
+            k_to_cache = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+            v_to_cache = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+        else:
+            k_to_cache = k_insert.to(dtype=key_cache.dtype)
+            v_to_cache = v_insert.to(dtype=value_cache.dtype)
         from vllm_ascend.device.device_op import DeviceOperator
 
         DeviceOperator.reshape_and_cache(
-            k_fp8,
-            v_fp8,
+            k_to_cache,
+            v_to_cache,
             key_cache,
             value_cache,
             main_meta.slot_mapping[:num_tokens],
