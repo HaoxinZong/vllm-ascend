@@ -189,6 +189,45 @@ def _active_prefill_num_reqs(
     return min(1, num_prefills)
 
 
+def _get_seq_lens_cpu(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> torch.Tensor:
+    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        raise RuntimeError(
+            "MiniMax M3 sparse attention requires CPU sequence lengths to "
+            "build K2Q metadata without a device-to-host synchronization"
+        )
+    if seq_lens_cpu.device.type != "cpu":
+        raise RuntimeError("MiniMax M3 CPU sequence lengths must be on CPU")
+    return seq_lens_cpu
+
+
+def _build_k2q_block_metadata(
+    seq_lens_cpu: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Build K2Q block metadata on CPU before entering the NPU hot path."""
+    block_lens_cpu = torch.div(
+        seq_lens_cpu.to(torch.int32) + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    )
+    cu_block_lens_cpu = torch.empty(
+        block_lens_cpu.numel() + 1,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    cu_block_lens_cpu[0] = 0
+    torch.cumsum(block_lens_cpu, dim=0, out=cu_block_lens_cpu[1:])
+    block_lens = block_lens_cpu.tolist()
+    total_rows = sum(block_lens)
+    max_kv = max(block_lens, default=0)
+    return cu_block_lens_cpu, total_rows, max_kv
+
+
 class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -618,6 +657,10 @@ class AscendMiniMaxM3SparseBackend(AttentionBackend):
 class AscendMiniMaxM3SparsePrefillMetadata:
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
+    cu_block_lens: torch.Tensor
+    k2q_total_rows: int
+    k2q_max_kv: int
+    block_size: int
     seq_lens: torch.Tensor
     actual_seq_lengths: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
@@ -666,6 +709,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self.block_size = kv_cache_spec.block_size
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
@@ -695,11 +739,13 @@ class AscendMiniMaxM3SparseMetadataBuilder(
         prefill_metadata: AscendMiniMaxM3SparsePrefillMetadata | None = None
         active_prefills = 0
         if num_prefills > 0:
+            seq_lens_cpu = _get_seq_lens_cpu(common_attn_metadata)
             active_prefills = _active_prefill_num_reqs(
                 num_prefills, num_prefill_tokens, qsl_cpu, num_decodes
             )
             prefill_end = num_decodes + active_prefills
             prefill_kv_lens = seq_lens[num_decodes:prefill_end]
+            prefill_kv_lens_cpu = seq_lens_cpu[num_decodes:prefill_end]
             prefill_cu_seqlens_q = (
                 query_start_loc[num_decodes : prefill_end + 1] - num_decode_tokens
             ).to(torch.int32)
@@ -708,6 +754,18 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             )
             prefill_cu_seqlens_k[0] = 0
             torch.cumsum(prefill_kv_lens, dim=0, out=prefill_cu_seqlens_k[1:])
+            (
+                prefill_cu_block_lens_cpu,
+                k2q_total_rows,
+                k2q_max_kv,
+            ) = _build_k2q_block_metadata(
+                prefill_kv_lens_cpu,
+                self.block_size,
+            )
+            prefill_cu_block_lens = prefill_cu_block_lens_cpu.to(
+                device=seq_lens.device,
+                non_blocking=True,
+            )
             prefill_query_lens_cpu = (
                 qsl_cpu[num_decodes + 1 : prefill_end + 1]
                 - qsl_cpu[num_decodes:prefill_end]
@@ -715,7 +773,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             prefill_context_lens = self.context_len_buffer[num_decodes:prefill_end]
             prefill_context_lens.copy_(
                 (
-                    prefill_kv_lens.detach().cpu() - prefill_query_lens_cpu
+                    prefill_kv_lens_cpu - prefill_query_lens_cpu
                 ).to(
                     device=self.context_len_buffer.device,
                     dtype=torch.int32,
@@ -732,6 +790,10 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             prefill_metadata = AscendMiniMaxM3SparsePrefillMetadata(
                 cu_seqlens_q=prefill_cu_seqlens_q,
                 cu_seqlens_k=prefill_cu_seqlens_k,
+                cu_block_lens=prefill_cu_block_lens,
+                k2q_total_rows=k2q_total_rows,
+                k2q_max_kv=k2q_max_kv,
+                block_size=self.block_size,
                 seq_lens=prefill_kv_lens,
                 actual_seq_lengths=prefill_actual_seq_lengths,
                 actual_seq_lengths_kv=prefill_actual_seq_lengths_kv,
@@ -929,7 +991,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            self.minimax_m3_sparse_attn_ascendc(
+            args = (
                 q[nd:],
                 kv_cache,
                 prefill_topk,
@@ -941,8 +1003,26 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
-                block_size=self.block_size,
             )
+            if self.minimax_m3_sparse_attn_ascendc is minimax_m3_sparse_attn_ascendc_pp8:
+                if p.block_size != self.block_size:
+                    raise ValueError(
+                        "MiniMax M3 K2Q metadata block size does not match the "
+                        f"sparse attention block size: {p.block_size} != "
+                        f"{self.block_size}"
+                    )
+                self.minimax_m3_sparse_attn_ascendc(
+                    *args,
+                    block_size=self.block_size,
+                    cu_block_lens=p.cu_block_lens,
+                    k2q_total_rows=p.k2q_total_rows,
+                    k2q_max_kv=p.k2q_max_kv,
+                )
+            else:
+                self.minimax_m3_sparse_attn_ascendc(
+                    *args,
+                    block_size=self.block_size,
+                )
         return output
 
         

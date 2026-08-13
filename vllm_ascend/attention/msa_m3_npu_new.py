@@ -37,25 +37,6 @@ def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:
     return (topk_idx >= 0).sum(dim=-1).to(dtype=torch.int32)
 
 
-def _build_cu_block_lens(
-    seq_lens: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Build cumulative logical KV-block counts for each prefill request."""
-    block_lens = torch.div(
-        seq_lens.to(torch.int32) + block_size - 1,
-        block_size,
-        rounding_mode="floor",
-    )
-    cu_block_lens = torch.empty(
-        block_lens.numel() + 1,
-        dtype=torch.int32,
-        device=seq_lens.device,
-    )
-    cu_block_lens[0] = 0
-    torch.cumsum(block_lens, dim=0, out=cu_block_lens[1:])
-    return cu_block_lens
-
 def _to_fp8(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
@@ -73,15 +54,20 @@ def minimax_m3_sparse_attn(
     sm_scale: float,
     output: torch.Tensor,
     block_size: int = 128,
+    *,
+    cu_block_lens: torch.Tensor,
+    k2q_total_rows: int,
+    k2q_max_kv: int,
 ) -> None:
     del prefix_lens, max_query_len
     key, value = _split_main_kv_cache(kv_cache)
-    cu_block_lens = _build_cu_block_lens(seq_lens, block_size)
     k2q_row_ptr, k2q_q_indices, k2q_slot_indices = npu_k2q_csr(
         topk_idx,
         cu_seqlens_q,
         cu_block_lens,
         order_method=1,
+        total_rows=k2q_total_rows,
+        max_kv=k2q_max_kv,
         use_simt=0,
         q_global_offset=True
     )
