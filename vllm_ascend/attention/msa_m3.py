@@ -1501,17 +1501,22 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
-        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
+        # scatter_pa_kv_cache requires key/value dtype == cache dtype.
+        if key_cache.dtype == torch.float8_e4m3fn:
+            k_to_cache = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+            v_to_cache = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+        else:
+            k_to_cache = k_insert.to(dtype=key_cache.dtype)
+            v_to_cache = v_insert.to(dtype=value_cache.dtype)
         from vllm_ascend.device.device_op import DeviceOperator
 
         DeviceOperator.reshape_and_cache(
-            k_fp8,
-            v_fp8,
+            k_to_cache,
+            v_to_cache,
             key_cache,
             value_cache,
             main_meta.slot_mapping[:num_tokens],
