@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -70,6 +71,9 @@ logger = init_logger(__name__)
 _SPARSE_ATTN_PREFILL_KV_CACHE_DTYPE = "bfloat16"
 
 _SPARSE_ATTN_LOGGED = False
+_INDEX_LOCAL_CP_ENABLED = (
+    os.getenv("VLLM_ASCEND_MINIMAX_M3_INDEXER_LOCAL_CP", "1") == "1"
+)
 _INDEX_LOCAL_CP_QUERY_TILE_SIZE = 128
 
 
@@ -425,7 +429,8 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
         self.local_cp_size = 1
         self.local_cp_rank = 0
         if (
-            isinstance(total_num_kv_heads, int)
+            _INDEX_LOCAL_CP_ENABLED
+            and isinstance(total_num_kv_heads, int)
             and total_num_kv_heads > 0
             and tensor_parallel_size > total_num_kv_heads
             and tensor_parallel_size % total_num_kv_heads == 0
@@ -1455,6 +1460,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         self.sparse_block_size = sparse_cfg["sparse_block_size"]
+        indexer_local_cp_size = (
+            self.qkv_proj.num_kv_head_replicas if _INDEX_LOCAL_CP_ENABLED else 1
+        )
         self.indexer = AscendMiniMaxM3Indexer(
             num_kv_heads=self.num_kv_heads,
             scale=self.scaling,
@@ -1467,7 +1475,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
-            head_replica_size=self.qkv_proj.num_kv_head_replicas,
+            head_replica_size=indexer_local_cp_size,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -1481,10 +1489,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             logger.warning(
                 "MiniMax M3 sparse attention enabled "
                 "(topk_blocks=%d, block_size=%d, local_index_cp=%d, "
-                "main_kv_cache_dtype=%s)",
+                "local_index_cp_enabled=%s, main_kv_cache_dtype=%s)",
                 sparse_cfg["sparse_topk_blocks"],
                 sparse_cfg["sparse_block_size"],
-                self.qkv_proj.num_kv_head_replicas,
+                indexer_local_cp_size,
+                _INDEX_LOCAL_CP_ENABLED,
                 self.kv_cache_dtype,
             )
             _SPARSE_ATTN_LOGGED = True
