@@ -38,6 +38,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.inputs import MultiModalDataDict
@@ -113,6 +114,31 @@ _EMBEDDING_QUANT_AUX_WEIGHT_SUBSTRS = [
     "embed_tokens.weight_scale",
     "lm_head.weight_scale",
 ]
+
+_M3_COMPARE = os.getenv("VLLM_ASCEND_MINIMAX_M3_COMPARE", "0") == "1"
+
+
+def _m3_compare_tensor(tag: str, tensor: torch.Tensor, full_l1: bool = False) -> None:
+    """Log a deterministic L1 summary for two-version comparison."""
+    if not _M3_COMPARE or get_tensor_model_parallel_rank() != 0:
+        return
+    with torch.no_grad():
+        flat = tensor.detach().reshape(-1)
+        probe = flat[:: max(flat.numel() // 64, 1)][:64].float()
+        l1 = (
+            flat.abs().sum(dtype=torch.float32).item()
+            if full_l1
+            else probe.abs().sum().item()
+        )
+        logger.warning(
+            "M3_COMPARE tag=%s shape=%s dtype=%s l1=%.9e l1_scope=%s absmax=%.9e",
+            tag,
+            tuple(tensor.shape),
+            tensor.dtype,
+            l1,
+            "full" if full_l1 else "sample64",
+            probe.abs().max().item(),
+        )
 
 
 def _is_minimax_m3_text_only() -> bool:
@@ -613,24 +639,51 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        compare_prefill = _M3_COMPARE and positions.numel() > 1
+
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if compare_prefill:
+            _m3_compare_tensor(
+                f"prefill/layer_{self.layer_idx}/attention_in",
+                hidden_states,
+                full_l1=True,
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if compare_prefill:
+            _m3_compare_tensor(
+                f"prefill/layer_{self.layer_idx}/attention_out",
+                hidden_states,
+                full_l1=True,
+            )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        block = "moe" if self.is_layer_sparse else "mlp"
+        if compare_prefill:
+            _m3_compare_tensor(
+                f"prefill/layer_{self.layer_idx}/{block}_in",
+                hidden_states,
+                full_l1=True,
+            )
 
         if self.is_layer_sparse:
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+        if compare_prefill:
+            _m3_compare_tensor(
+                f"prefill/layer_{self.layer_idx}/{block}_out",
+                hidden_states,
+                full_l1=True,
+            )
 
         return hidden_states, residual
 
@@ -714,6 +767,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        if _M3_COMPARE and positions.numel() > 1 and get_pp_group().is_first_rank:
+            _m3_compare_tensor("prefill/embedding", hidden_states, full_l1=True)
+
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
@@ -728,6 +784,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if _M3_COMPARE and positions.numel() > 1:
+            _m3_compare_tensor("prefill/final_norm", hidden_states, full_l1=True)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -1030,6 +1088,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
             skipped_multimodal_tensors,
             len(loaded_params),
         )
+        if _M3_COMPARE:
+            probe_names = {
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            }
+            for name, param in self.named_parameters():
+                canonical_name = name.replace(".routed_experts", "")
+                if name in loaded_params and canonical_name in probe_names:
+                    _m3_compare_tensor(f"loaded/{canonical_name}", param)
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

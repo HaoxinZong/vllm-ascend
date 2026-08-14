@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
@@ -38,6 +40,25 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
+
+_M3_COMPARE = os.getenv("VLLM_ASCEND_MINIMAX_M3_COMPARE", "0") == "1"
+
+
+def _m3_compare_quant_tensor(tag: str, tensor: torch.Tensor) -> None:
+    if not _M3_COMPARE or get_tensor_model_parallel_rank() != 0:
+        return
+    with torch.no_grad():
+        flat = tensor.detach().reshape(-1)
+        probe = flat[:: max(flat.numel() // 64, 1)][:64].float()
+        logger.warning(
+            "M3_COMPARE tag=%s shape=%s dtype=%s sum=%.9e absmax=%.9e first=%s",
+            tag,
+            tuple(tensor.shape),
+            tensor.dtype,
+            probe.sum().item(),
+            probe.abs().max().item(),
+            probe[:8].cpu().tolist(),
+        )
 
 
 @register_scheme("W8A8_MXFP8", "linear")
@@ -123,6 +144,11 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         if getattr(layer, "_mxfp8_transformed", False):
             return
 
+        prefix = getattr(layer, "prefix", getattr(layer, "layer_name", "")).replace(
+            ".routed_experts", ""
+        )
+        compare_layer = prefix.endswith("layers.0.self_attn.qkv_proj")
+
         # Store original shapes for RL weight reloading
         # Only store on first call (when shapes are in original format)
         if not hasattr(layer, "_mxfp8_original_shapes"):
@@ -143,6 +169,9 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
 
         # Mark as transformed
         layer._mxfp8_transformed = True
+        if compare_layer:
+            _m3_compare_quant_tensor(f"loaded/{prefix}/weight", layer.weight)
+            _m3_compare_quant_tensor(f"loaded/{prefix}/weight_scale", layer.weight_scale)
 
     def restore_weights_for_rl_loading(self, layer):
         """Restore weights to original shapes for RL weight reloading.
@@ -365,6 +394,11 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         if getattr(layer, "_mxfp8_transformed", False):
             return
 
+        prefix = getattr(layer, "prefix", getattr(layer, "layer_name", "")).replace(
+            ".routed_experts", ""
+        )
+        compare_layer = prefix.endswith("layers.3.block_sparse_moe.experts")
+
         # Store original shapes for RL weight reloading
         # Only store on first call (when shapes are in original format)
         if not hasattr(layer, "_mxfp8_original_shapes"):
@@ -386,6 +420,11 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
 
         # Mark as transformed
         layer._mxfp8_transformed = True
+        if compare_layer:
+            for name in ("w13_weight", "w13_weight_scale"):
+                _m3_compare_quant_tensor(
+                    f"loaded/{prefix}/{name}", getattr(layer, name)
+                )
 
     def restore_weights_for_rl_loading(self, layer):
         """Restore weights to original shapes for RL weight reloading.
