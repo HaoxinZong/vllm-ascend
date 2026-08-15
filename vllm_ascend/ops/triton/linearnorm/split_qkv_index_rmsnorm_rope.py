@@ -22,6 +22,8 @@ Concat layout ``[q | k | v | index_q | index_k]``.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -33,13 +35,47 @@ from vllm_ascend.ops.triton.triton_utils import (
     insert_slice,
 )
 
-# A2 UB=192KB；预留后取 85KB，与原 QKV kernel 一致，避免 tile 过大。
-_UB_SIZE = 87040
+# * 910_95 / 950 物理 UB=256KB，编译器预留 8KB。
+_A5_UB_RESERVE = 8 * 1024
+_UB_KB_A2 = 192
+_UB_KB_A5 = 256
+
+
+@lru_cache(maxsize=1)
+def _ub_size_bytes() -> int:
+    """按当前 NPU 卡型取可用 UB 字节数。
+
+    A2 / 910B / 910_93：192KB；A5 / 910_95 / 950：256KB - 8KB 编译器预留。
+    优先读 Triton 运行时 ``ub_size_in_kbytes``（与编译器同源）。
+    """
+    kb: int | None = None
+    try:
+        from triton.backends.ascend.runtime import utils as npu_utils
+
+        kb = int(npu_utils.ub_size_in_kbytes)
+    except Exception:
+        kb = None
+    if kb is None:
+        name = ""
+        try:
+            name = str(torch.npu.get_device_name(0) or "")
+        except Exception:
+            name = ""
+        arch = name.lower()
+        is_a5 = any(
+            m in arch
+            for m in ("910_95", "91095", "ascend950", "950pr", "950dt", "dav-c310")
+        )
+        kb = _UB_KB_A5 if is_a5 else _UB_KB_A2
+    nbytes = kb * 1024
+    if kb >= _UB_KB_A5:
+        nbytes -= _A5_UB_RESERVE
+    return nbytes
 
 
 def _tokens_per_iter(elem_size: int, elems_per_token: int, *, cap: int = 2) -> int:
     """三路 loop 的 UB 会被同时计入，再叠加 multibuffer，按 1/4 UB 估 tile。"""
-    n = int((_UB_SIZE // 4) / max(elem_size, 1)) // max(int(elems_per_token), 1)
+    n = int((_ub_size_bytes() // 4) / max(elem_size, 1)) // max(int(elems_per_token), 1)
     return max(1, min(cap, n))
 
 
