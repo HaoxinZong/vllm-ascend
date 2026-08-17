@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -121,7 +121,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
     idx_qk_heads_per_iter: tl.constexpr,  # * tile * index_qk_head_num，reshape 用
     index_q_head_num: tl.constexpr,  # * indexer Q 头数
     index_qk_head_num: tl.constexpr,  # * indexer Q 头数 + 1（共享 index_k）
-    INDEX_OUT_FP8: tl.constexpr,  # * indexer 输出 clamp ±448 再存 e4m3；main 保持输入 dtype
+    ATTN_OUT_FP8: tl.constexpr,  # * main Q/K/V clamp ±448 再存 e4m3
+    INDEX_OUT_FP8: tl.constexpr,  # * indexer 输出 clamp ±448 再存 e4m3
 ):
     row_pid = tl.program_id(0)
 
@@ -249,6 +250,9 @@ def split_qkv_index_rmsnorm_rope_kernel(
             sizes=(batch_size_per_iter_per_vec, q_head_num, ATTN_HALF),
             strides=(1, 1, 1),
         )
+        # * FP8：RoPE 后 clamp ±448，再按输出 dtype store
+        if ATTN_OUT_FP8:
+            q_heads = tl.minimum(tl.maximum(q_heads, -448.0), 448.0)
         q_output_idx = output_q_nblk_idx[None, :] + row64[:, None] * q_hidden_size
         q_store_mask = (mmask[:, None]) & (output_q_nmask[None, :])
         tl.store(
@@ -297,6 +301,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
             sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
             strides=(1, 1, 1),
         )
+        if ATTN_OUT_FP8:
+            k_heads = tl.minimum(tl.maximum(k_heads, -448.0), 448.0)
         kv_output_idx = output_kv_nblk_idx[None, :] + row64[:, None] * kv_hidden_size
         k_store_mask = (mmask[:, None]) & (output_kv_nmask[None, :])
         tl.store(
@@ -319,6 +325,9 @@ def split_qkv_index_rmsnorm_rope_kernel(
         row64 = mblk_idx.to(tl.int64)
         idx = row64[:, None] * total_hidden_size + nblk_idx[None, :]
         values = tl.load(input_gm_ptr + idx, mask=mask)
+        # * V 无 RoPE，FP8 仍先 clamp 再按输出 dtype store
+        if ATTN_OUT_FP8:
+            values = tl.minimum(tl.maximum(values.to(tl.float32), -448.0), 448.0)
         out_idx = row64[:, None] * kv_hidden_size + out_nblk_idx[None, :]
         out_mask = (mmask[:, None]) & (out_nmask[None, :])
         tl.store(
@@ -462,10 +471,11 @@ def split_qkv_index_rmsnorm_rope_kernel(
             strides=(1, 1, 1),
         )
 
-        # * FP8：indexer RoPE 后 clamp ±448 再按输出 dtype store；main Q/K/V 保持输入 dtype
+        # * FP8：indexer RoPE 后 clamp ±448 再按输出 dtype store
         if INDEX_OUT_FP8:
             iq_heads = tl.minimum(tl.maximum(iq_heads, -448.0), 448.0)
             ik_heads = tl.minimum(tl.maximum(ik_heads, -448.0), 448.0)
+
 
         iq_idx = out_iq_nblk[None, :] + row64[:, None] * index_q_size
         ik_idx = out_ik_nblk[None, :] + row64[:, None] * IDX_HEAD_DIM
@@ -501,14 +511,16 @@ def split_qkv_index_rmsnorm_rope_impl(
     head_dim: int,
     idx_head_dim: int,
     eps: float,
-    out_fp8: bool = False,
+    attn_out_fp8: bool = False,
+    indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused split → Gemma RMSNorm → Neox RoPE（attn + indexer）。
 
     Concat 布局 ``[q | k | v | index_q | index_k]``。
-    ``out_fp8=True`` 时 indexer 先 clamp ±448 再写成 e4m3；main Q/K/V 保持输入 dtype。
+    ``attn_out_fp8=True`` 时 main Q/K/V clamp ±448 再写成 e4m3；
+    ``indexer_out_fp8=True`` 时 indexer 同样 clamp ±448 再写成 e4m3。
     """
     input = input.contiguous()
     positions = positions.contiguous()
@@ -524,11 +536,12 @@ def split_qkv_index_rmsnorm_rope_impl(
     attn_rope_dim = min(cache_dim, int(head_dim))
     idx_rope_dim = min(cache_dim, int(idx_head_dim))
     bias = q_bias is not None
-    index_dtype = torch.float8_e4m3fn if out_fp8 else input.dtype
+    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
 
-    q_out = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
-    k_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
-    v_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
+    q_out = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=attn_dtype)
+    k_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
+    v_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
     index_q_out = torch.empty(batch_size, index_q_size, device=input.device, dtype=index_dtype)
     index_k_out = torch.empty(batch_size, idx_head_dim, device=input.device, dtype=index_dtype)
 
@@ -599,7 +612,8 @@ def split_qkv_index_rmsnorm_rope_impl(
         int(idx_batch_tile * index_qk_head_num),
         index_q_head_num,
         index_qk_head_num,
-        out_fp8,
+        attn_out_fp8,
+        indexer_out_fp8,
     )
     return q_out, k_out, v_out, index_q_out, index_k_out
 
@@ -618,15 +632,17 @@ def split_qkv_index_rmsnorm_rope_impl_fake(
     head_dim: int,
     idx_head_dim: int,
     eps: float,
-    out_fp8: bool = False,
+    attn_out_fp8: bool = False,
+    indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = input.shape[0]
-    index_dtype = torch.float8_e4m3fn if out_fp8 else input.dtype
-    q_output = torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=input.dtype)
-    k_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=input.dtype)
-    v_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=input.dtype)
+    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
+    q_output = torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=attn_dtype)
+    k_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype)
+    v_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype)
     index_q_output = torch.empty(
         batch_size, int(index_q_size), device=input.device, dtype=index_dtype
     )

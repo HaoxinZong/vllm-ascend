@@ -1587,7 +1587,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 head_dim=self.head_dim,
                 idx_head_dim=self.idx_head_dim,
                 eps=self.q_norm.variance_epsilon,
-                out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
+                attn_out_fp8=False,
+                indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
                 q_bias=None,
                 k_bias=None,
             )
