@@ -321,9 +321,14 @@ at::Tensor npu_sparse_attention_score_meta(
 {
     TORCH_CHECK(std::string(q_input_layout) == "TND",
                 "npu_sparse_attention_score only supports query TND layout");
-    at::ScalarType out_dtype = (query.scalar_type() == at::kFloat8_e4m3fn)
-                                   ? at::kHalf
-                                   : query.scalar_type();
+    at::ScalarType out_dtype = query.scalar_type();
+    if (query.scalar_type() == at::kFloat8_e4m3fn) {
+#ifdef ASCEND_PLATFORM_950
+        out_dtype = at::kBFloat16;
+#else
+        out_dtype = at::kHalf;
+#endif
+    }
     return at::empty_symint(query.sym_sizes(),
                             query.options().dtype(out_dtype).device(c10::kMeta));
 }
@@ -1355,7 +1360,11 @@ at::Tensor npu_sparse_attention_score_prefill_meta(
     (void)inner_precise;
     (void)actual_seq_lengths;
     (void)actual_seq_lengths_kv;
-    return at::empty_like(query);
+    at::ScalarType out_dtype = query.scalar_type() == at::kFloat8_e4m3fn
+                                   ? at::kBFloat16
+                                   : query.scalar_type();
+    return at::empty_symint(query.sym_sizes(),
+                            query.options().dtype(out_dtype).device(c10::kMeta));
 }
 
 void npu_scatter_nd_update_v2_meta(

@@ -206,6 +206,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "k2q_csr"
+        "sparse_attention_score_950"
+        "sparse_attention_score_prefill"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
