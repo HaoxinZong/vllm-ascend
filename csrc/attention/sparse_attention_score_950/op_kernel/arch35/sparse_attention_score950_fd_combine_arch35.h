@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_FD_COMBINE_ARCH35_H
-#define SPARSE_ATTENTION_SCORE_950_FD_COMBINE_ARCH35_H
+#ifndef SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H
+#define SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H
 
 #include <limits>
 #include "kernel_operator.h"
@@ -262,4 +262,4 @@ private:
 
 }  // namespace SasaKernelArch35
 
-#endif  // SPARSE_ATTENTION_SCORE_950_FD_COMBINE_ARCH35_H
+#endif  // SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H

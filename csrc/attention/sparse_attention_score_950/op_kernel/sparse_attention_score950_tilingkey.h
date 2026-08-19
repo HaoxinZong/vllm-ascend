@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_TILINGKEY_H
-#define SPARSE_ATTENTION_SCORE_950_TILINGKEY_H
+#ifndef SPARSE_ATTENTION_SCORE950_TILINGKEY_H
+#define SPARSE_ATTENTION_SCORE950_TILINGKEY_H
 
 #include "kernel_tiling/kernel_tiling.h"
 
@@ -50,4 +50,4 @@
 #define SASA_FP16_D128_ARCH22_NTD_FD_TILING  20007
 #define SASA_BF16_D128_ARCH22_NTD_FD_TILING  20008
 
-#endif  // SPARSE_ATTENTION_SCORE_950_TILINGKEY_H
+#endif  // SPARSE_ATTENTION_SCORE950_TILINGKEY_H

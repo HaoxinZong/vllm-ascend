@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_H_
-#define SPARSE_ATTENTION_SCORE_950_H_
+#ifndef SPARSE_ATTENTION_SCORE950_H_
+#define SPARSE_ATTENTION_SCORE950_H_
 
 #include <array>
 #include "opdev/op_executor.h"
@@ -40,4 +40,4 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
 
 } // namespace l0op
 
-#endif  // SPARSE_ATTENTION_SCORE_950_H_
+#endif  // SPARSE_ATTENTION_SCORE950_H_

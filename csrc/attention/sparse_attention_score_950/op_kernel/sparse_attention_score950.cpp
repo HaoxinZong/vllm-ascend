@@ -10,10 +10,10 @@
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
-#include "sparse_attention_score_950_tilingkey.h"
-#include "sparse_attention_score_950_kernel_interface.cpp"
+#include "sparse_attention_score950_tilingkey.h"
+#include "sparse_attention_score950_kernel_interface.cpp"
 
-extern "C" __global__ __aicore__ void sparse_attention_score_950(
+extern "C" __global__ __aicore__ void sparse_attention_score950(
     __gm__ uint8_t* query,
     __gm__ uint8_t* key,
     __gm__ uint8_t* value,

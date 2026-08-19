@@ -10,7 +10,7 @@
 
 #include "aclnn_sparse_attention_score.h"
 
-#include "sparse_attention_score_950.h"
+#include "sparse_attention_score950.h"
 #include "aclnn_kernels/contiguous.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"

@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_TILING_H
-#define SPARSE_ATTENTION_SCORE_950_TILING_H
+#ifndef SPARSE_ATTENTION_SCORE950_TILING_H
+#define SPARSE_ATTENTION_SCORE950_TILING_H
 
 #include <cstdint>
 #include <array>
@@ -244,4 +244,4 @@ private:
 
 }  // namespace optiling
 
-#endif  // SPARSE_ATTENTION_SCORE_950_TILING_H
+#endif  // SPARSE_ATTENTION_SCORE950_TILING_H

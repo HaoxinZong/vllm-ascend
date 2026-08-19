@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "sparse_attention_score_950_tiling.h"
+#include "sparse_attention_score950_tiling.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -20,7 +20,7 @@
 #include "graph/types.h"
 #include "graph/tensor.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "op_host/tiling_base.h"
+#include "tiling/tiling_base.h"
 
 using namespace ge;
 using namespace std;

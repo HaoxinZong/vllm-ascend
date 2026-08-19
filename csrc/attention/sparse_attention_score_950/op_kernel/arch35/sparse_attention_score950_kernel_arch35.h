@@ -1,19 +1,16 @@
 /*
- * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH35_FULL_QUANT_H
-#define SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH35_FULL_QUANT_H
-
-#include "kernel_utils.hpp"
+#include "../arch35/kernel_utils.hpp"
 #include "../kernel_common.hpp"
-#include "sparse_attention_score_950_fd_combine_arch35.h"
+#include "../arch35/sparse_attention_score950_fd_combine_arch35.h"
 
 using namespace NpuArch;
 using namespace tla;
@@ -27,9 +24,8 @@ template <
     class EpilogueRescaleO,
     Format qFormat,
     Format kvFormat,
-    bool IS_FD = false,
-    bool IS_DENSE = false>
-class SasaFullQuantKernelArch35 {
+    bool IS_FD = false>
+class SasaRegularKernelArch35 {
 public:
     using ArchTag = typename BlockMmadPV::ArchTag;
 
@@ -39,7 +35,7 @@ public:
     using ElementP = typename BlockMmadPV::ElementA;
     using ElementV = typename BlockMmadPV::ElementB;
     using ElementOTmp = typename BlockMmadPV::ElementC;
-    using ElementO = typename EpilogueOnlineSoftmax::ElementInput;
+    using ElementO = typename BlockMmadQK::ElementA;
 
     using LayoutQ = layout::RowMajor;
     using LayoutK = layout::ColumnMajor;
@@ -56,37 +52,34 @@ public:
     static constexpr uint32_t UB_S_OTMP_BUF_STAGES = 2;
 
     __aicore__ inline
-    SasaFullQuantKernelArch35() {}
+    SasaRegularKernelArch35() {}
 
     __aicore__ inline
-    void operator()(SasaFullQuantKernelParamsArch35 const &params)
+    void operator()(SasaKernelParamsArch35 const &params)
     {
-        __gm__ SparseAttn::SparseAttentionScore950TilingData *sasaTilingData =
+        __gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData =
             reinterpret_cast<__gm__ SparseAttn::SparseAttentionScore950TilingData *>(params.tiling);
-        FetchBaseShapeInfo(sasaTilingData);
-        CalcOnChipBufTileInfo(sasaTilingData);
+        FetchBaseShapeInfo(tilingData);
+        CalcOnChipBufTileInfo(tilingData);
 
-        // global buffers
         AscendC::GlobalTensor<ElementQ> gQ;
         gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
         AscendC::GlobalTensor<ElementK> gK;
         gK.SetGlobalBuffer((__gm__ ElementK *)params.k);
-        AscendC::GlobalTensor<ElementV> gV;
-        gV.SetGlobalBuffer((__gm__ ElementV *)params.v);
+        AscendC::GlobalTensor<ElementK> gV;
+        gV.SetGlobalBuffer((__gm__ ElementK *)params.v);
+        AscendC::GlobalTensor<int32_t> gSelectIdx;
+        gSelectIdx.SetGlobalBuffer((__gm__ int32_t *)params.selectIdx);
+        AscendC::GlobalTensor<int32_t> gBlockTable;
+        gBlockTable.SetGlobalBuffer((__gm__ int32_t *)params.blockTable);
+        AscendC::GlobalTensor<int32_t> gSelectNumIdx;
+        gSelectNumIdx.SetGlobalBuffer((__gm__ int32_t *)params.selectNumIdx);
         AscendC::GlobalTensor<int32_t> gActualQseqlen;
         gActualQseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualQseqlen);
         AscendC::GlobalTensor<int32_t> gActualKvseqlen;
         gActualKvseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualKvseqlen);
-        AscendC::GlobalTensor<int32_t> gSelectIdx;
-        gSelectIdx.SetGlobalBuffer((__gm__ int32_t *)params.selectIdx);
-        AscendC::GlobalTensor<int32_t> gSelectNumIdx;
-        gSelectNumIdx.SetGlobalBuffer((__gm__ int32_t *)params.selectNumIdx);
-
-        AscendC::GlobalTensor<int32_t> gBlockTable;
-        gBlockTable.SetGlobalBuffer((__gm__ int32_t *)params.blockTable);
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
-
         AscendC::GlobalTensor<int32_t> gIdentityIdx;
         gIdentityIdx.SetGlobalBuffer((__gm__ int32_t *)(params.workSpace + fdIdentityOffset_));
         AscendC::GlobalTensor<float> gPartialLse;
@@ -96,7 +89,6 @@ public:
             gPartialO.SetGlobalBuffer((__gm__ float *)(params.workSpace + fdPartialOOffset_));
         }
 
-        // cross core data move dst buffers
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_OTMP_BUF_STAGES];
         AscendC::LocalTensor<ElementOTmp> ubOTmpTensor[UB_S_OTMP_BUF_STAGES];
@@ -107,11 +99,10 @@ public:
 
         InitSyncFlags<4, 4, 4>();
 
-        // Write identity index [0] to workspace so SparseKL1TileNLoad does contiguous read
 #ifdef __DAV_CUBE__
         coreIdx = AscendC::GetBlockIdx();
         gIdentityIdx.SetValue(0, 0);
-        for (uint32_t i = 1; i < fdIdentityCount_; i++) {
+        for (uint32_t i = 1; i < topK_; i++) {
             gIdentityIdx.SetValue(i, 0);
         }
 #endif
@@ -139,25 +130,11 @@ public:
         uint32_t taskLoopStep = coreNum;
         uint32_t fdFlatTaskStart = 0;
         uint32_t fdFlatTaskEnd = 0;
-        uint32_t fdStartBaseTask = 0;
-        uint32_t fdStartBlockIdx = 0;
-        uint32_t fdEndBaseTask = 0;
-        uint32_t fdEndBlockIdx = 0;
         if constexpr (IS_FD) {
-            if constexpr (IS_DENSE) {
-                fdStartBaseTask = sasaTilingData->fdCoreStartBaseTask[coreIdx];
-                fdStartBlockIdx = sasaTilingData->fdCoreStartBlockIdx[coreIdx];
-                fdEndBaseTask = sasaTilingData->fdCoreEndBaseTask[coreIdx];
-                fdEndBlockIdx = sasaTilingData->fdCoreEndBlockIdx[coreIdx];
-                taskLoopStart = fdStartBaseTask;
-                taskLoopEnd = fdEndBaseTask +
-                    ((fdEndBaseTask < totalTaskNum_ && fdEndBlockIdx > 0U) ? 1U : 0U);
-            } else {
-                fdFlatTaskStart = sasaTilingData->fdCoreTaskStart[coreIdx];
-                fdFlatTaskEnd = sasaTilingData->fdCoreTaskEnd[coreIdx];
-                taskLoopStart = fdFlatTaskStart / topK_;
-                taskLoopEnd = CeilDiv(fdFlatTaskEnd, topK_);
-            }
+            fdFlatTaskStart = tilingData->fdCoreTaskStart[coreIdx];
+            fdFlatTaskEnd = tilingData->fdCoreTaskEnd[coreIdx];
+            taskLoopStart = fdFlatTaskStart / topK_;
+            taskLoopEnd = CeilDiv(fdFlatTaskEnd, topK_);
             taskLoopStep = 1;
         }
         for (uint32_t taskLoopIdx = taskLoopStart; taskLoopIdx < taskLoopEnd; taskLoopIdx += taskLoopStep) {
@@ -166,16 +143,16 @@ public:
             uint32_t rawEnd = topK_;
             uint32_t fdPartialTaskId = 0;
             bool isFdPartial = false;
-            if constexpr (IS_FD && !IS_DENSE) {
+            if constexpr (IS_FD) {
                 const uint32_t taskFlatStart = taskIdx * topK_;
                 rawBegin = fdFlatTaskStart > taskFlatStart ? fdFlatTaskStart - taskFlatStart : 0;
                 const uint32_t remainingFlatTasks = fdFlatTaskEnd - taskFlatStart;
                 rawEnd = remainingFlatTasks < topK_ ? remainingFlatTasks : topK_;
-                const uint32_t splitCount = sasaTilingData->fdPartialCountByBase[taskIdx];
+                const uint32_t splitCount = tilingData->fdPartialCountByBase[taskIdx];
                 isFdPartial = splitCount > 1;
                 if (isFdPartial) {
-                    const uint32_t firstCore = taskFlatStart / sasaTilingData->fdCorePerCoreTaskNum;
-                    fdPartialTaskId = sasaTilingData->fdPartialStartByBase[taskIdx] + coreIdx - firstCore;
+                    const uint32_t firstCore = taskFlatStart / tilingData->fdCorePerCoreTaskNum;
+                    fdPartialTaskId = tilingData->fdPartialStartByBase[taskIdx] + coreIdx - firstCore;
                 }
             }
             uint32_t qToken = taskIdx / kvHeads_;
@@ -200,61 +177,42 @@ public:
                                 static_cast<int64_t>(qHeadStart) * strideQHead;
             int64_t gmOffsetO = gmOffsetQ;
 
+            int64_t selectIdxBase = static_cast<int64_t>(kvHeadIdx) * maxQSeqlen_ * topK_ +
+                                    static_cast<int64_t>(qToken) * topK_;
+            uint32_t validTopK = topK_;
+            if (params.selectNumIdx != nullptr) {
+                int64_t selectNumOffset = static_cast<int64_t>(kvHeadIdx) * maxQSeqlen_ + qToken;
+                validTopK = static_cast<uint32_t>(gSelectNumIdx.GetValue(selectNumOffset));
+            }
+            if constexpr (!IS_FD) {
+                if (validTopK == 0) continue;
+                rawEnd = validTopK;
+            } else {
+                rawBegin = rawBegin < validTopK ? rawBegin : validTopK;
+                rawEnd = rawEnd < validTopK ? rawEnd : validTopK;
+            }
+
             uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(batchIdx));
             uint32_t qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(batchIdx));
             uint32_t historyLen = kvSeqlen - qSeqlen;
-            uint32_t visibleKvLen = historyLen + qTokenInBatch + 1U;
-            uint32_t validLogicalBlockNum = CeilDiv(visibleKvLen, blockSize_);
-            int64_t selectIdxBase = static_cast<int64_t>(kvHeadIdx) * maxQSeqlen_ * topK_ +
-                                    static_cast<int64_t>(qToken) * topK_;
+            uint32_t lastBlockTileSize = (historyLen + qTokenInBatch) % blockSize_ + 1;
 
-            if constexpr (IS_DENSE) {
-                rawEnd = validLogicalBlockNum;
-                if constexpr (IS_FD) {
-                    if (taskIdx == fdStartBaseTask) {
-                        rawBegin = fdStartBlockIdx;
-                    }
-                    if (taskIdx == fdEndBaseTask) {
-                        rawEnd = fdEndBlockIdx;
-                    }
-                    rawBegin = rawBegin < validLogicalBlockNum ? rawBegin : validLogicalBlockNum;
-                    rawEnd = rawEnd < validLogicalBlockNum ? rawEnd : validLogicalBlockNum;
-                    const uint32_t splitCount = sasaTilingData->fdPartialCountByBase[taskIdx];
-                    isFdPartial = splitCount > 1U;
-                    if (isFdPartial) {
-                        uint32_t partialOrdinal = 0U;
-                        for (uint32_t previousCore = 0; previousCore < coreIdx; ++previousCore) {
-                            if (DenseCoreIntersectsBaseTask(sasaTilingData, previousCore, taskIdx)) {
-                                ++partialOrdinal;
-                            }
-                        }
-                        fdPartialTaskId = sasaTilingData->fdPartialStartByBase[taskIdx] + partialOrdinal;
-                    }
-                }
-            } else {
-                uint32_t validTopK = topK_;
-                if (params.selectNumIdx != nullptr) {
-                    int64_t selectNumOffset = static_cast<int64_t>(kvHeadIdx) * maxQSeqlen_ + qToken;
-                    const int32_t selectNum = gSelectNumIdx.GetValue(selectNumOffset);
-                    validTopK = selectNum <= 0 ? 0U :
-                        (static_cast<uint32_t>(selectNum) < topK_ ? static_cast<uint32_t>(selectNum) : topK_);
-                }
-                if constexpr (!IS_FD) {
-                    if (validTopK == 0U) {
-                        continue;
-                    }
-                    rawEnd = validTopK;
-                } else {
-                    rawBegin = rawBegin < validTopK ? rawBegin : validTopK;
-                    rawEnd = rawEnd < validTopK ? rawEnd : validTopK;
-                }
+            uint32_t kvSLoopNum = rawEnd - rawBegin;
+            int32_t validPhysicalIds[16];
+            uint32_t validTileSize[16];
+            uint32_t lastLogicalBlockId = (historyLen + qTokenInBatch) / blockSize_;
+            uint32_t actualLoopNum = 0;
+            for (uint32_t i = rawBegin; i < rawEnd && i < topK_; i++) {
+                int32_t logicalId = gSelectIdx.GetValue(selectIdxBase + i);
+                if (logicalId < 0) continue;
+                int64_t btOffset = static_cast<int64_t>(batchIdx) * maxBlocksPerBatch_ + logicalId;
+                int32_t physicalId = gBlockTable.GetValue(btOffset);
+                validPhysicalIds[actualLoopNum] = physicalId;
+                validTileSize[actualLoopNum] = (static_cast<uint32_t>(logicalId) == lastLogicalBlockId) ?
+                    lastBlockTileSize : blockSize_;
+                actualLoopNum++;
             }
-
-            uint32_t kvSLoopNum = rawEnd > rawBegin ? rawEnd - rawBegin : 0U;
-            if constexpr (!IS_DENSE) {
-                kvSLoopNum = CountSparseLogicalBlocks(
-                    gSelectIdx, selectIdxBase, rawBegin, rawEnd, validLogicalBlockNum);
-            }
+            kvSLoopNum = actualLoopNum;
 
             uint32_t rowNum = groupSize;
             uint32_t rowNumRound = RoundUp(rowNum, 16);
@@ -287,14 +245,8 @@ public:
 
             for (uint32_t kvBlockIdx = 0; kvBlockIdx < kvSLoopNum + PRE_LAUNCH; kvBlockIdx++) {
                 if (kvBlockIdx < kvSLoopNum) {
-                    const int32_t logicalBlockId = ResolveLogicalBlockId(
-                        gSelectIdx, selectIdxBase, rawBegin, rawEnd, validLogicalBlockNum, kvBlockIdx);
-                    const int64_t blockTableOffset =
-                        static_cast<int64_t>(batchIdx) * maxBlocksPerBatch_ + logicalBlockId;
-                    const int32_t physicalBlockId = gBlockTable.GetValue(blockTableOffset);
-                    const uint32_t blockStartToken = static_cast<uint32_t>(logicalBlockId) * blockSize_;
-                    const uint32_t remainingTokens = visibleKvLen - blockStartToken;
-                    const uint32_t kvSTileSizeAct = remainingTokens < blockSize_ ? remainingTokens : blockSize_;
+                    uint32_t kvSTileSizeAct = validTileSize[kvBlockIdx];
+                    int32_t physicalBlockId = validPhysicalIds[kvBlockIdx];
 
                     int64_t gmOffsetK = static_cast<int64_t>(physicalBlockId) * strideKVBlock +
                                         static_cast<int64_t>(kvHeadIdx) * strideKVHead;
@@ -348,14 +300,8 @@ public:
                 }
                 if (kvBlockIdx >= PRE_LAUNCH) {
                     uint32_t kvBlockIdxDe = kvBlockIdx - PRE_LAUNCH;
-                    const int32_t logicalBlockId = ResolveLogicalBlockId(
-                        gSelectIdx, selectIdxBase, rawBegin, rawEnd, validLogicalBlockNum, kvBlockIdxDe);
-                    const int64_t blockTableOffset =
-                        static_cast<int64_t>(batchIdx) * maxBlocksPerBatch_ + logicalBlockId;
-                    const int32_t physicalBlockIdV = gBlockTable.GetValue(blockTableOffset);
-                    const uint32_t blockStartToken = static_cast<uint32_t>(logicalBlockId) * blockSize_;
-                    const uint32_t remainingTokens = visibleKvLen - blockStartToken;
-                    const uint32_t kvSTileSizeAct = remainingTokens < blockSize_ ? remainingTokens : blockSize_;
+                    uint32_t kvSTileSizeAct = validTileSize[kvBlockIdxDe];
+                    int32_t physicalBlockIdV = validPhysicalIds[kvBlockIdxDe];
 
                     int64_t gmOffsetV = static_cast<int64_t>(physicalBlockIdV) * strideKVBlock +
                                         static_cast<int64_t>(kvHeadIdx) * strideKVHead;
@@ -426,68 +372,12 @@ public:
             AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
             SparseAttentionScore950FdCombineArch35<ElementO, Arch::Resource<ArchTag>> combine(resource);
-            combine(sasaTilingData, gPartialLse, gPartialO, gO);
+            combine(tilingData, gPartialLse, gPartialO, gO);
 #endif
         }
     }
 
 private:
-    __aicore__ inline
-    uint32_t CountSparseLogicalBlocks(AscendC::GlobalTensor<int32_t> &gSelectIdx,
-                                      int64_t selectIdxBase,
-                                      uint32_t rawBegin,
-                                      uint32_t rawEnd,
-                                      uint32_t validLogicalBlockNum)
-    {
-        uint32_t count = 0U;
-        for (uint32_t rawIdx = rawBegin; rawIdx < rawEnd; ++rawIdx) {
-            const int32_t logicalBlockId = gSelectIdx.GetValue(selectIdxBase + rawIdx);
-            if (logicalBlockId >= 0 && static_cast<uint32_t>(logicalBlockId) < validLogicalBlockNum) {
-                ++count;
-            }
-        }
-        return count;
-    }
-
-    __aicore__ inline
-    int32_t ResolveLogicalBlockId(AscendC::GlobalTensor<int32_t> &gSelectIdx,
-                                  int64_t selectIdxBase,
-                                  uint32_t rawBegin,
-                                  uint32_t rawEnd,
-                                  uint32_t validLogicalBlockNum,
-                                  uint32_t packedBlockIdx)
-    {
-        if constexpr (IS_DENSE) {
-            return static_cast<int32_t>(rawBegin + packedBlockIdx);
-        }
-        uint32_t validIdx = 0U;
-        for (uint32_t rawIdx = rawBegin; rawIdx < rawEnd; ++rawIdx) {
-            const int32_t logicalBlockId = gSelectIdx.GetValue(selectIdxBase + rawIdx);
-            if (logicalBlockId < 0 || static_cast<uint32_t>(logicalBlockId) >= validLogicalBlockNum) {
-                continue;
-            }
-            if (validIdx == packedBlockIdx) {
-                return logicalBlockId;
-            }
-            ++validIdx;
-        }
-        return 0;
-    }
-
-    __aicore__ inline
-    bool DenseCoreIntersectsBaseTask(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData,
-                                     uint32_t coreIdx,
-                                     uint32_t baseTask)
-    {
-        const uint32_t startBaseTask = tilingData->fdCoreStartBaseTask[coreIdx];
-        const uint32_t endBaseTask = tilingData->fdCoreEndBaseTask[coreIdx];
-        const uint32_t endBlockIdx = tilingData->fdCoreEndBlockIdx[coreIdx];
-        const bool startsBeforeTaskEnd = startBaseTask <= baseTask;
-        const bool endsAfterTaskStart = endBaseTask > baseTask ||
-            (endBaseTask == baseTask && endBlockIdx > 0U);
-        return startsBeforeTaskEnd && endsAfterTaskStart;
-    }
-
     __aicore__ inline
     void FetchBaseShapeInfo(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData)
     {
@@ -499,6 +389,7 @@ private:
         topK_ = tilingData->topK;
         maxBlocksPerBatch_ = tilingData->maxBlocksPerBatch;
         totalTaskNum_ = tilingData->totalTaskNum;
+        firstBatchTaskNum_ = tilingData->firstBatchTaskNum;
         scaleValue_ = tilingData->scaleValue;
         maxQSeqlen_ = tilingData->maxQSeqlen;
         groupSize_ = tilingData->groupSize;
@@ -506,7 +397,6 @@ private:
         qHeadStride_ = tilingData->qHeadStride;
         kvHeadStride_ = tilingData->kvHeadStride;
         kvTokenStride_ = tilingData->kvTokenStride;
-        fdIdentityCount_ = tilingData->fdIdentityCount > 0U ? tilingData->fdIdentityCount : 1U;
         fdIdentityOffset_ = IS_FD ? tilingData->fdIdentityOffset : 0;
         fdLseSubStride_ = tilingData->fdLseSubStride;
         fdPartialLseOffset_ = tilingData->fdPartialLseOffset;
@@ -584,7 +474,7 @@ private:
                 rowNumPerSubCore * colNumPerSubCore * sizeof(ElementS) * i);
             ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
                 rowNumPerSubCore * colNumPerSubCore * sizeof(ElementS) * UB_S_OTMP_BUF_STAGES +
-                rowNumPerSubCore * colNumPerSubCore * sizeof(ElementS) * UB_S_OTMP_BUF_STAGES +
+                rowNumPerSubCore * colNumPerSubCore * sizeof(ElementP) * UB_S_OTMP_BUF_STAGES +
                 rowNumPerSubCore * rescaleCol * sizeof(ElementOTmp) * i);
         }
     }
@@ -691,6 +581,7 @@ private:
 
 private:
     Arch::Resource<ArchTag> resource;
+    // basic shape info
     uint32_t batch_;
     uint32_t qHeads_;
     uint32_t kvHeads_;
@@ -699,6 +590,7 @@ private:
     uint32_t topK_;
     uint32_t maxBlocksPerBatch_;
     uint32_t totalTaskNum_;
+    uint32_t firstBatchTaskNum_;
     float scaleValue_;
     uint32_t maxQSeqlen_;
     uint32_t groupSize_;
@@ -706,7 +598,6 @@ private:
     uint32_t qHeadStride_;
     uint32_t kvHeadStride_;
     uint32_t kvTokenStride_;
-    uint32_t fdIdentityCount_;
     uint32_t fdLseSubStride_;
     uint64_t fdIdentityOffset_;
     uint64_t fdPartialLseOffset_;
@@ -737,6 +628,4 @@ private:
     Gemm::Block::Mm2L1TileHelper mm2L1TileHelper_;
 };
 
-}  // namespace SasaKernelArch35
-
-#endif  // SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH35_FULL_QUANT_H
+} // namespace SasaKernelArch35

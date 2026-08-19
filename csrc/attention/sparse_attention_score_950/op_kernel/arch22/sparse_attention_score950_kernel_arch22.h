@@ -8,12 +8,12 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH22_H
-#define SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH22_H
+#ifndef SPARSE_ATTENTION_SCORE950_KERNEL_ARCH22_H
+#define SPARSE_ATTENTION_SCORE950_KERNEL_ARCH22_H
 
 #include "../kernel_common.hpp"
 #include "kernel_utils.hpp"
-#include "sparse_attention_score_950_fd_combine_arch22.h"
+#include "sparse_attention_score950_fd_combine_arch22.h"
 
 using namespace NpuArch;
 
@@ -561,4 +561,4 @@ private:
 
 }  // namespace SasaKernelArch22
 
-#endif  // SPARSE_ATTENTION_SCORE_950_KERNEL_ARCH22_H
+#endif  // SPARSE_ATTENTION_SCORE950_KERNEL_ARCH22_H
