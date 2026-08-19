@@ -113,7 +113,7 @@ ge::graphStatus InferDataTypeSparseAttentionScore(gert::InferDataTypeContext *co
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_INFERSHAPE(SparseAttentionScore950)
+IMPL_OP_INFERSHAPE(SparseAttentionScore_950)
     .InferShape(InferShapeSparseAttentionScore)
     .InferDataType(InferDataTypeSparseAttentionScore);
 

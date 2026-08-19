@@ -1012,7 +1012,7 @@ ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForSparseAttentionScore(gert::Tili
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(SparseAttentionScore950)
+IMPL_OP_OPTILING(SparseAttentionScore_950)
     .Tiling(TilingSparseAttentionScore)
     .TilingInputsDataDependency({5, 6, 7},
         {gert::TilingPlacement::TILING_ON_HOST, gert::TilingPlacement::TILING_ON_AICPU})

@@ -17,7 +17,7 @@ endif()
 
 if (BUILD_OPS_RTY_KERNEL)
     add_ops_compile_options(
-            OP_NAME SparseAttentionScore950
+            OP_NAME SparseAttentionScore_950
             OPTIONS --cce-auto-sync=off
                     -DASCENDC_DUMP=1
                     -Wno-deprecated-declarations

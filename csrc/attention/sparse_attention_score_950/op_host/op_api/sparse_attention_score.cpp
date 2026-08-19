@@ -17,9 +17,9 @@ using namespace op;
 
 namespace l0op {
 
-OP_TYPE_REGISTER(SparseAttentionScore950);
+OP_TYPE_REGISTER(SparseAttentionScore_950);
 
-const std::array<const aclTensor *, 2> SparseAttentionScore950(
+const std::array<const aclTensor *, 2> SparseAttentionScore_950(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -41,7 +41,7 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
     const aclTensor *attentionOut,
     aclOpExecutor *executor)
 {
-    L0_DFX(SparseAttentionScore950, query, key, value, selectIdx, blockTable,
+    L0_DFX(SparseAttentionScore_950, query, key, value, selectIdx, blockTable,
            selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
            qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional,
            numKeyValueHeads, scaleValue, blockSize, topK, innerPrecise,
@@ -56,7 +56,7 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
     auto attentionOutTensor = executor->AllocTensor(outDtype, Format::FORMAT_ND, Format::FORMAT_ND);
     auto softmaxLseTensor = executor->AllocTensor(DataType::DT_FLOAT, Format::FORMAT_ND, Format::FORMAT_ND);
 
-    auto ret = INFER_SHAPE(SparseAttentionScore950,
+    auto ret = INFER_SHAPE(SparseAttentionScore_950,
                            OP_INPUT(query, key, value, selectIdx, blockTable,
                                     selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
                                     qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional),
@@ -69,11 +69,11 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
                                    inputLayout,
                                    isDense));
     if (ret != ACLNN_SUCCESS) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "SparseAttentionScore950 infer shape failed.");
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "SparseAttentionScore_950 infer shape failed.");
         return {nullptr, nullptr};
     }
 
-    ADD_TO_LAUNCHER_LIST_AICORE(SparseAttentionScore950,
+    ADD_TO_LAUNCHER_LIST_AICORE(SparseAttentionScore_950,
                                 OP_INPUT(query, key, value, selectIdx, blockTable,
                                          selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
                                          qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional),
