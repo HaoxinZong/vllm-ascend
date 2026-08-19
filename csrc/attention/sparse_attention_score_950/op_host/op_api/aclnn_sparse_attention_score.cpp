@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "aclnn_sparse_attention_score_950.h"
+#include "aclnn_sparse_attention_score.h"
 
 #include "sparse_attention_score_950.h"
 #include "aclnn_kernels/contiguous.h"
@@ -74,7 +74,7 @@ static aclnnStatus MakeContiguous(const aclTensor *&query,
 
 } // namespace
 
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950GetWorkspaceSize(
+__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetWorkspaceSize(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -105,7 +105,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950G
     CHECK_RET(workspaceSize != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(executor != nullptr, ACLNN_ERR_PARAM_NULLPTR);
 
-    L2_DFX_PHASE_1(aclnnSparseAttentionScore950,
+    L2_DFX_PHASE_1(aclnnSparseAttentionScore,
                    DFX_IN(query, key, value, selectIdx, blockTable, selectNumIdxOptional,
                           actualSeqLengthsOptional, actualSeqLengthsKvOptional,
                           qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional,
@@ -152,13 +152,13 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950G
     return ACLNN_SUCCESS;
 }
 
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950(
+__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore(
     void *workspace,
     uint64_t workspaceSize,
     aclOpExecutor *executor,
     aclrtStream stream)
 {
-    L2_DFX_PHASE_2(aclnnSparseAttentionScore950);
+    L2_DFX_PHASE_2(aclnnSparseAttentionScore);
     return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }
 

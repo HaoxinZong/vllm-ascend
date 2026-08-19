@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef ACLNN_SPARSE_ATTENTION_SCORE_950_H_
-#define ACLNN_SPARSE_ATTENTION_SCORE_950_H_
+#ifndef ACLNN_SPARSE_ATTENTION_SCORE_H_
+#define ACLNN_SPARSE_ATTENTION_SCORE_H_
 
 #include "aclnn/acl_meta.h"
 
@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950GetWorkspaceSize(
+__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetWorkspaceSize(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -39,7 +39,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950G
     uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950(
+__attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore(
     void *workspace,
     uint64_t workspaceSize,
     aclOpExecutor *executor,
@@ -49,4 +49,4 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScore950(
 }
 #endif
 
-#endif  // ACLNN_SPARSE_ATTENTION_SCORE_950_H_
+#endif  // ACLNN_SPARSE_ATTENTION_SCORE_H_

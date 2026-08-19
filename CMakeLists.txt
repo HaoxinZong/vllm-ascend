@@ -156,10 +156,6 @@ if(SOC_VERSION MATCHES "ascend310p.*")
     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
 endif()
 
-if(SOC_VERSION MATCHES "ascend950")
-    target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_950)
-endif()
-
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()

@@ -46,11 +46,7 @@
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
-#ifdef ASCEND_PLATFORM_950
-#include "attention/sparse_attention_score_950/sparse_attention_score_950_torch_adpt.h"
-#else
 #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
-#endif
 #include "attention/sparse_attention_score_prefill/sparse_attention_score_prefill_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
