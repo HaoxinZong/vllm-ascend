@@ -17,7 +17,7 @@ function(kernel_src_copy)
   cmake_parse_arguments(KNCPY "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
   add_custom_target(${KNCPY_TARGET})
   foreach(OP_DIR ${KNCPY_IMPL_DIR})
-    get_filename_component(OP_NAME ${OP_DIR} NAME)
+    resolve_op_build_name("${OP_DIR}" OP_NAME)
     message(STATUS "start copy kernel file: ${OP_NAME} to ${KNCPY_DST_DIR}")
     if(NOT TARGET ${OP_NAME}_src_copy)
       set(SRC_DIR ${OP_DIR}/op_kernel)
@@ -330,7 +330,7 @@ function(gen_ops_info_and_python)
   if(ENABLE_BINARY OR ENABLE_CUSTOM)
     foreach(compute_unit ${ASCEND_COMPUTE_UNIT})
       foreach(OP_DIR ${COMPILED_OP_DIRS})
-        get_filename_component(op_name ${OP_DIR} NAME)
+        resolve_op_build_name("${OP_DIR}" op_name)
         # generate opc shell scripts for autogen binary config ops
         generate_bin_scripts(
           TARGET gen_bin_scripts

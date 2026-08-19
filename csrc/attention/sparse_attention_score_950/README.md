@@ -1,9 +1,6 @@
-# SparseAttentionScore950
+# SparseAttentionScore
 
 Sparse Attention 算子：根据外部传入的 TopK block 索引（selectIdx）+ blockTable（逻辑->物理映射），从 blocked KV cache 中 gather 对应 KV blocks，执行 FlashAttention 计算。
-
-外层 `sparse_attention_score_950` 目录用于 A5 构建选择；实际算子位于
-`sparse_attention_score950` 子目录，使 CANN 的算子名、kernel 源目录和 binary key 保持一致。
 
 ## 接口
 
@@ -22,6 +19,7 @@ torch_npu.npu_sparse_attention_score(
     scale_value=1.0,
     block_size=128,
     top_k=16,
+    attention_out_dtype=torch.bfloat16,
 ) -> Tensor  # [T, N, D]
 ```
 

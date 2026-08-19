@@ -7,13 +7,27 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+get_filename_component(OP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" DIRECTORY)
+# build_aclnn.sh selects this source tree by its _950 directory name, while the
+# operator and all generated artifacts intentionally retain their canonical name.
+set_property(DIRECTORY "${OP_SOURCE_DIR}" PROPERTY ASCEND_OP_BUILD_NAME sparse_attention_score)
+add_op_to_compiled_list()
 
-file(GLOB CURRENT_DIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
-if(NOT ENABLE_TEST AND NOT BENCHMARK)
-    list(REMOVE_ITEM CURRENT_DIRS tests)
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnnExc PRIVATE
+        sparse_attention_score_def.cpp
+    )
 endif()
-foreach(SUB_DIR ${CURRENT_DIRS})
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SUB_DIR}/CMakeLists.txt")
-        add_subdirectory(${SUB_DIR})
-    endif()
-endforeach()
+
+if (BUILD_OPS_RTY_KERNEL)
+    add_ops_compile_options(
+            OP_NAME SparseAttentionScore
+            OPTIONS --cce-auto-sync=off
+                    -DASCENDC_DUMP=1
+                    -Wno-deprecated-declarations
+                    -Werror
+                    -fpermissive
+    )
+else()
+    add_modules_sources(OPTYPE sparse_attention_score ACLNNTYPE aclnn_exclude)
+endif()
