@@ -18,7 +18,7 @@ namespace SparseAttn {
 constexpr uint32_t SASA_FD_MAX_AIC = 32;
 constexpr uint32_t SASA_FD_MAX_BASE_TASK = 32;
 
-struct SparseAttentionScoreTilingData {
+struct SparseAttentionScore950TilingData {
     uint32_t batch;
     uint32_t numHeads;
     uint32_t kvHeads;

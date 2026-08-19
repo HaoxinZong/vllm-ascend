@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "sparse_attention_score_tiling.h"
+#include "sparse_attention_score950_tiling.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -113,7 +113,7 @@ ge::graphStatus SASATiling::GetNpuInfo(gert::TilingContext *context)
 ge::graphStatus SASATiling::ParseAttrs(gert::TilingContext *context)
 {
     auto attrs = context->GetAttrs();
-    OP_CHECK_IF(attrs == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(attrs == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "GetAttrs returned nullptr."), return ge::GRAPH_FAILED);
 
     const int64_t *numKvHeadsPtr = attrs->GetInt(ATTR_NUM_KV_HEADS_INDEX);
@@ -142,7 +142,7 @@ ge::graphStatus SASATiling::ParseAttrs(gert::TilingContext *context)
     }
 
     const char *inputLayoutPtr = attrs->GetAttrPointer<char>(ATTR_INPUT_LAYOUT_INDEX);
-    OP_CHECK_IF(inputLayoutPtr == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(inputLayoutPtr == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "input_layout is nullptr."), return ge::GRAPH_FAILED);
     const std::string inputLayout(inputLayoutPtr);
     if (inputLayout == "TND") {
@@ -185,7 +185,7 @@ ge::graphStatus SASATiling::CheckAttentionOutDtype(gert::TilingContext *sasConte
 ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
 {
     const gert::StorageShape *queryShape = context->GetInputShape(QUERY_INDEX);
-    OP_CHECK_IF(queryShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(queryShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "Query shape is nullptr."), return ge::GRAPH_FAILED);
 
     const auto &qShape = queryShape->GetStorageShape();
@@ -205,10 +205,10 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
     embeddingSize_ = static_cast<uint32_t>(qEmbedDim);
 
     const gert::StorageShape *keyShape = context->GetInputShape(KEY_INDEX);
-    OP_CHECK_IF(keyShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(keyShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "Key shape is nullptr."), return ge::GRAPH_FAILED);
     const gert::StorageShape *valueShape = context->GetInputShape(VALUE_INDEX);
-    OP_CHECK_IF(valueShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(valueShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "Value shape is nullptr."), return ge::GRAPH_FAILED);
     const auto &kShape = keyShape->GetStorageShape();
     const auto &vShape = valueShape->GetStorageShape();
@@ -250,7 +250,7 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
     }
 
     const gert::StorageShape *blockTableShape = context->GetInputShape(BLOCK_TABLE_INDEX);
-    OP_CHECK_IF(blockTableShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(blockTableShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "BlockTable shape is nullptr."), return ge::GRAPH_FAILED);
     if (blockTableShape->GetStorageShape().GetDimNum() != 2U) {
         OP_LOGE(context->GetNodeName(), "BlockTable must be rank 2.");
@@ -264,7 +264,7 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
         maxQSeqlen_ = totalQTokens_;
     } else {
         const gert::StorageShape *selectIdxShape = context->GetOptionalInputShape(SELECT_IDX_INDEX);
-        OP_CHECK_IF(selectIdxShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        OP_CHECK_IF(selectIdxShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
             "SelectIdx is required in sparse mode."), return ge::GRAPH_FAILED);
         const auto &selectShape = selectIdxShape->GetStorageShape();
         if (selectShape.GetDimNum() != 3U) {
@@ -296,7 +296,7 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
     }
     if (!denseMode_ && (isQNtd_ || isKvNtd_)) {
         OP_LOGE(context->GetNodeName(),
-            "SparseAttentionScore only supports the legacy TND layout.");
+            "SparseAttentionScore950 only supports the legacy TND layout.");
         return ge::GRAPH_FAILED;
     }
     if (isQNtd_ && dataType_ != ge::DT_FLOAT16 && dataType_ != ge::DT_BF16 &&
@@ -932,7 +932,7 @@ ge::graphStatus SASATiling::FillTilingData(gert::TilingContext *context)
 }
 
 ge::graphStatus SASATiling::GetTiling(gert::TilingContext *context,
-    SparseAttentionScoreTilingData &tilingData)
+    SparseAttentionScore950TilingData &tilingData)
 {
     tilingData_ = &tilingData;
 
@@ -980,10 +980,10 @@ ge::graphStatus SASATiling::GetTiling(gert::TilingContext *context,
 }
 
 ge::graphStatus SASATiling::SetTilingData(gert::TilingContext *context,
-    SparseAttentionScoreTilingData &tilingData)
+    SparseAttentionScore950TilingData &tilingData)
 {
     OP_CHECK_IF(context->GetRawTilingData() == nullptr,
-        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "RawTilingData got from GE context is nullptr."), return ge::GRAPH_FAILED);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
                             context->GetRawTilingData()->GetCapacity());
@@ -991,11 +991,11 @@ ge::graphStatus SASATiling::SetTilingData(gert::TilingContext *context,
     return ge::GRAPH_SUCCESS;
 }
 
-ASCENDC_EXTERN_C ge::graphStatus TilingSparseAttentionScore(gert::TilingContext* context)
+ASCENDC_EXTERN_C ge::graphStatus TilingSparseAttentionScore950(gert::TilingContext* context)
 {
-    OP_CHECK_IF(context == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+    OP_CHECK_IF(context == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore950",
         "Context is nullptr."), return ge::GRAPH_FAILED);
-    SparseAttentionScoreTilingData tilingData;
+    SparseAttentionScore950TilingData tilingData;
     SASATiling tiling;
     if (tiling.GetTiling(context, tilingData) == ge::GRAPH_SUCCESS) {
         tiling.SetTilingData(context, tilingData);
@@ -1006,16 +1006,16 @@ ASCENDC_EXTERN_C ge::graphStatus TilingSparseAttentionScore(gert::TilingContext*
     }
 }
 
-ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForSparseAttentionScore(gert::TilingParseContext* context)
+ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForSparseAttentionScore950(gert::TilingParseContext* context)
 {
     (void)context;
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(SparseAttentionScore)
-    .Tiling(TilingSparseAttentionScore)
+IMPL_OP_OPTILING(SparseAttentionScore950)
+    .Tiling(TilingSparseAttentionScore950)
     .TilingInputsDataDependency({5, 6, 7},
         {gert::TilingPlacement::TILING_ON_HOST, gert::TilingPlacement::TILING_ON_AICPU})
-    .TilingParse<SparseAttentionScoreCompileInfo>(TilingPrepareForSparseAttentionScore);
+    .TilingParse<SparseAttentionScore950CompileInfo>(TilingPrepareForSparseAttentionScore950);
 
 }  // namespace optiling

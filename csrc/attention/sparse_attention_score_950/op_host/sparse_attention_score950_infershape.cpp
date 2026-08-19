@@ -35,14 +35,14 @@ static constexpr uint32_t LSE_DIM_D = 1;
 
 static constexpr int32_t UNKNOWN_DIMS = -2;
 
-static ge::graphStatus InferShapeSparseAttentionScore(gert::InferShapeContext *context)
+static ge::graphStatus InferShapeSparseAttentionScore950(gert::InferShapeContext *context)
 {
     if (context == nullptr) {
-        OP_LOGE("SparseAttentionScore", "context is nullptr!");
+        OP_LOGE("SparseAttentionScore950", "context is nullptr!");
         return ge::GRAPH_FAILED;
     }
 
-    OP_LOGD(context->GetNodeName(), "Enter SparseAttentionScore InferShape impl.");
+    OP_LOGD(context->GetNodeName(), "Enter SparseAttentionScore950 InferShape impl.");
 
     const gert::Shape *queryShape = context->GetInputShape(QUERY_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, queryShape);
@@ -74,14 +74,14 @@ static ge::graphStatus InferShapeSparseAttentionScore(gert::InferShapeContext *c
     const std::string inputLayoutStr(inputLayout);
     if (inputLayoutStr != "TND" && inputLayoutStr != "NTD" && inputLayoutStr != "TND_BNSD") {
         OP_LOGE(context->GetNodeName(),
-                "SparseAttentionScore input_layout only supports TND, NTD or TND_BNSD, got %s.",
+                "SparseAttentionScore950 input_layout only supports TND, NTD or TND_BNSD, got %s.",
                 inputLayout);
         return ge::GRAPH_FAILED;
     }
 
     if (queryShape->GetDimNum() != TND_DIM_NUM) {
         OP_LOGE(context->GetNodeName(),
-                "SparseAttentionScore queryDims(%zu) must be 3 for %s layout!",
+                "SparseAttentionScore950 queryDims(%zu) must be 3 for %s layout!",
                 queryShape->GetDimNum(), inputLayout);
         return ge::GRAPH_FAILED;
     }
@@ -93,11 +93,11 @@ static ge::graphStatus InferShapeSparseAttentionScore(gert::InferShapeContext *c
     (*softmaxLseShape)[TND_DIM_N] = queryShape->GetDim(TND_DIM_N);
     (*softmaxLseShape)[TND_DIM_D] = LSE_DIM_D;
 
-    OP_LOGD(context->GetNodeName(), "SparseAttentionScore InferShape success.");
+    OP_LOGD(context->GetNodeName(), "SparseAttentionScore950 InferShape success.");
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus InferDataTypeSparseAttentionScore(gert::InferDataTypeContext *context)
+ge::graphStatus InferDataTypeSparseAttentionScore950(gert::InferDataTypeContext *context)
 {
     if (context == nullptr) {
         return ge::GRAPH_FAILED;
@@ -113,8 +113,8 @@ ge::graphStatus InferDataTypeSparseAttentionScore(gert::InferDataTypeContext *co
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_INFERSHAPE(SparseAttentionScore)
-    .InferShape(InferShapeSparseAttentionScore)
-    .InferDataType(InferDataTypeSparseAttentionScore);
+IMPL_OP_INFERSHAPE(SparseAttentionScore950)
+    .InferShape(InferShapeSparseAttentionScore950)
+    .InferDataType(InferDataTypeSparseAttentionScore950);
 
 }  // namespace ops

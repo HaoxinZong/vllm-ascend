@@ -10,7 +10,7 @@
 
 #include "aclnn_sparse_attention_score.h"
 
-#include "sparse_attention_score.h"
+#include "sparse_attention_score950.h"
 #include "aclnn_kernels/contiguous.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
@@ -124,7 +124,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetW
         return ret;
     }
 
-    auto outputs = l0op::SparseAttentionScore(
+    auto outputs = l0op::SparseAttentionScore950(
         query, key, value, selectIdx, blockTable,
         selectNumIdxOptional,
         actualSeqLengthsOptional, actualSeqLengthsKvOptional,
@@ -135,7 +135,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetW
         executorImpl);
 
     if (outputs[0] == nullptr) {
-        OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "SparseAttentionScore returned nullptr output.");
+        OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "SparseAttentionScore950 returned nullptr output.");
         return ACLNN_ERR_INNER_NULLPTR;
     }
 
