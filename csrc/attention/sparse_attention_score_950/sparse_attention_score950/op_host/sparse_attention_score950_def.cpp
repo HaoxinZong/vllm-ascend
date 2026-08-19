@@ -85,7 +85,9 @@ public:
         this->Attr("is_dense").AttrType(OPTIONAL).Bool(false);
         this->AICore().AddConfig("ascend910b");
         this->AICore().AddConfig("ascend910_93");
-        this->AICore().AddConfig("ascend950");
+        OpAICoreConfig config950;
+        config950.ExtendCfgInfo("opFile.value", "sparse_attention_score950");
+        this->AICore().AddConfig("ascend950", config950);
     }
 };
 
