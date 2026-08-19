@@ -182,7 +182,9 @@ public:
             uint32_t validTopK = topK_;
             if (params.selectNumIdx != nullptr) {
                 int64_t selectNumOffset = static_cast<int64_t>(kvHeadIdx) * maxQSeqlen_ + qToken;
-                validTopK = static_cast<uint32_t>(gSelectNumIdx.GetValue(selectNumOffset));
+                const int32_t selectNum = gSelectNumIdx.GetValue(selectNumOffset);
+                validTopK = selectNum <= 0 ? 0U :
+                    (static_cast<uint32_t>(selectNum) < topK_ ? static_cast<uint32_t>(selectNum) : topK_);
             }
             if constexpr (!IS_FD) {
                 if (validTopK == 0) continue;
@@ -192,8 +194,13 @@ public:
                 rawEnd = rawEnd < validTopK ? rawEnd : validTopK;
             }
 
-            uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(batchIdx));
-            uint32_t qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(batchIdx));
+            const int32_t kvSeqlenValue = gActualKvseqlen.GetValue(batchIdx);
+            const int32_t qSeqlenValue = gActualQseqlen.GetValue(batchIdx);
+            if (qSeqlenValue <= 0 || kvSeqlenValue < qSeqlenValue) {
+                continue;
+            }
+            uint32_t kvSeqlen = static_cast<uint32_t>(kvSeqlenValue);
+            uint32_t qSeqlen = static_cast<uint32_t>(qSeqlenValue);
             uint32_t historyLen = kvSeqlen - qSeqlen;
             uint32_t lastBlockTileSize = (historyLen + qTokenInBatch) % blockSize_ + 1;
 
@@ -204,9 +211,15 @@ public:
             uint32_t actualLoopNum = 0;
             for (uint32_t i = rawBegin; i < rawEnd && i < topK_; i++) {
                 int32_t logicalId = gSelectIdx.GetValue(selectIdxBase + i);
-                if (logicalId < 0) continue;
+                if (logicalId < 0 || static_cast<uint32_t>(logicalId) > lastLogicalBlockId ||
+                    static_cast<uint32_t>(logicalId) >= maxBlocksPerBatch_) {
+                    continue;
+                }
                 int64_t btOffset = static_cast<int64_t>(batchIdx) * maxBlocksPerBatch_ + logicalId;
                 int32_t physicalId = gBlockTable.GetValue(btOffset);
+                if (physicalId < 0) {
+                    continue;
+                }
                 validPhysicalIds[actualLoopNum] = physicalId;
                 validTileSize[actualLoopNum] = (static_cast<uint32_t>(logicalId) == lastLogicalBlockId) ?
                     lastBlockTileSize : blockSize_;
