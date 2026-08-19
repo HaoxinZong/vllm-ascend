@@ -7,10 +7,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-get_filename_component(OP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" DIRECTORY)
 # build_aclnn.sh selects this source tree by its _950 directory name, while the
 # operator and all generated artifacts intentionally retain their canonical name.
-set_property(DIRECTORY "${OP_SOURCE_DIR}" PROPERTY ASCEND_OP_BUILD_NAME sparse_attention_score)
+set_property(GLOBAL PROPERTY ASCEND_OP_BUILD_NAME_sparse_attention_score_950 sparse_attention_score)
 add_op_to_compiled_list()
 
 if (BUILD_OPEN_PROJECT)
