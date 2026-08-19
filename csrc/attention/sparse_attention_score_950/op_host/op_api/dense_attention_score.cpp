@@ -38,7 +38,7 @@ const std::array<const aclTensor *, 2> DenseAttentionScore(
     // Keep the shared op's legacy input slots stable with an existing int32
     // tensor. Host and Kernel both ignore these two slots when isDense=true.
     const aclTensor *unusedSparseMetadata = blockTable;
-    return SparseAttentionScore(
+    return SparseAttentionScore950(
         query, key, value, unusedSparseMetadata, blockTable, unusedSparseMetadata,
         actualSeqLengths, actualSeqLengthsKv,
         qDequantScale, kDequantScale, vDequantScale,

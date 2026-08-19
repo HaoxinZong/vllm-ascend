@@ -16,7 +16,7 @@
 
 namespace l0op {
 
-const std::array<const aclTensor *, 2> SparseAttentionScore(
+const std::array<const aclTensor *, 2> SparseAttentionScore950(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,

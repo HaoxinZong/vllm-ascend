@@ -35,7 +35,7 @@ void RunTilingCase(ge::DataType dtype, int64_t qTokens, int64_t qHeads, int64_t 
     optiling::SparseAttentionScoreCompileInfo compileInfo{};
 
     gert::TilingContextPara context(
-        "SparseAttentionScore",
+        "SparseAttentionScore950",
         {
             {{{qTokens, qHeads, HEAD_DIM}, {qTokens, qHeads, HEAD_DIM}}, dtype, ge::FORMAT_ND},
             {{{topK, BLOCK_SIZE, kvHeads, HEAD_DIM}, {topK, BLOCK_SIZE, kvHeads, HEAD_DIM}},

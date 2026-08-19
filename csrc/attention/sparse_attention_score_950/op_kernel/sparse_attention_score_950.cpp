@@ -13,7 +13,7 @@
 #include "sparse_attention_score_tilingkey.h"
 #include "sparse_attention_score_kernel_interface.cpp"
 
-extern "C" __global__ __aicore__ void sparse_attention_score(
+extern "C" __global__ __aicore__ void sparse_attention_score_950(
     __gm__ uint8_t* query,
     __gm__ uint8_t* key,
     __gm__ uint8_t* value,

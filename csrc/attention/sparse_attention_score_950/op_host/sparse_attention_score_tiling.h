@@ -124,7 +124,7 @@ TILING_DATA_FIELD_DEF(uint64_t, fdIdentityOffset);
 TILING_DATA_FIELD_DEF(uint64_t, fdPartialLseOffset);
 TILING_DATA_FIELD_DEF(uint64_t, fdPartialOOffset);
 END_TILING_DATA_DEF;
-REGISTER_TILING_DATA_CLASS(SparseAttentionScore, SparseAttentionScoreTilingData)
+REGISTER_TILING_DATA_CLASS(SparseAttentionScore950, SparseAttentionScoreTilingData)
 
 struct SparseAttentionScoreCompileInfo {
     uint32_t inputDataByte = 2;

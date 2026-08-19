@@ -124,7 +124,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetW
         return ret;
     }
 
-    auto outputs = l0op::SparseAttentionScore(
+    auto outputs = l0op::SparseAttentionScore950(
         query, key, value, selectIdx, blockTable,
         selectNumIdxOptional,
         actualSeqLengthsOptional, actualSeqLengthsKvOptional,
@@ -135,7 +135,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseAttentionScoreGetW
         executorImpl);
 
     if (outputs[0] == nullptr) {
-        OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "SparseAttentionScore returned nullptr output.");
+        OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "SparseAttentionScore950 returned nullptr output.");
         return ACLNN_ERR_INNER_NULLPTR;
     }
 

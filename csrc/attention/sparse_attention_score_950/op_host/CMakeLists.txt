@@ -7,20 +7,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# build_aclnn.sh selects this source tree by its _950 directory name, while the
-# operator and all generated artifacts intentionally retain their canonical name.
-set_property(GLOBAL PROPERTY ASCEND_OP_BUILD_NAME_sparse_attention_score_950 sparse_attention_score)
 add_op_to_compiled_list()
 
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnnExc PRIVATE
-        sparse_attention_score_def.cpp
+        sparse_attention_score_950_def.cpp
     )
 endif()
 
 if (BUILD_OPS_RTY_KERNEL)
     add_ops_compile_options(
-            OP_NAME SparseAttentionScore
+            OP_NAME SparseAttentionScore950
             OPTIONS --cce-auto-sync=off
                     -DASCENDC_DUMP=1
                     -Wno-deprecated-declarations
@@ -28,5 +25,5 @@ if (BUILD_OPS_RTY_KERNEL)
                     -fpermissive
     )
 else()
-    add_modules_sources(OPTYPE sparse_attention_score ACLNNTYPE aclnn_exclude)
+    add_modules_sources(OPTYPE sparse_attention_score_950 ACLNNTYPE aclnn_exclude)
 endif()

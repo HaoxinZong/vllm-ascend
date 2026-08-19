@@ -549,7 +549,7 @@ if (BUILD_OPS_RTY_KERNEL)
     )
 
     foreach (op_dir ${OP_DIR_LIST})
-        resolve_op_build_name("${op_dir}" _op_name)
+        get_filename_component(_op_name "${op_dir}" NAME)
 
         if (EXISTS "${op_dir}/op_kernel")
             file(GLOB KERNEL_FILES

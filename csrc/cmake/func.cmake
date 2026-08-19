@@ -139,23 +139,9 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     set(${OP_DIR_LIST} ${_OP_DIR_LIST} PARENT_SCOPE)
 endfunction()
 
-function(resolve_op_build_name OP_DIR OUTPUT_VAR)
-    # A SoC-specific source directory may still implement an operator with the
-    # canonical CANN name used by generated Python and kernel binary artifacts.
-    get_filename_component(OP_SOURCE_NAME "${OP_DIR}" NAME)
-    set(OP_BUILD_NAME_PROPERTY "ASCEND_OP_BUILD_NAME_${OP_SOURCE_NAME}")
-    get_property(HAS_EXPLICIT_BUILD_NAME GLOBAL PROPERTY "${OP_BUILD_NAME_PROPERTY}" SET)
-    if(HAS_EXPLICIT_BUILD_NAME)
-        get_property(OP_BUILD_NAME GLOBAL PROPERTY "${OP_BUILD_NAME_PROPERTY}")
-    else()
-        set(OP_BUILD_NAME "${OP_SOURCE_NAME}")
-    endif()
-    set(${OUTPUT_VAR} "${OP_BUILD_NAME}" PARENT_SCOPE)
-endfunction()
-
 macro(add_op_to_compiled_list)
     get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
-    resolve_op_build_name("${PARENT_DIR}" OP_NAME)
+    get_filename_component(OP_NAME ${PARENT_DIR} NAME)
     # 记录全局的COMPILED_OPS和COMPILED_OP_DIRS，其中COMPILED_OP_DIRS只记录到算子名，例如moe/moe_token_permute_with_routing_map_grad
     set(COMPILED_OPS ${COMPILED_OPS} ${OP_NAME} CACHE STRING "Compiled Ops" FORCE)
     set(COMPILED_OP_DIRS ${COMPILED_OP_DIRS} ${PARENT_DIR} CACHE STRING "Compiled Ops Dirs" FORCE)
@@ -478,7 +464,7 @@ function(add_bin_compile_target)
     file(MAKE_DIRECTORY  ${BIN_OUT_DIR})
 
     foreach(_op_info ${BINARY_OP_INFO})
-        resolve_op_build_name("${_op_info}" _op_name)
+        get_filename_component(_op_name "${_op_info}" NAME)
         set(${_op_name}_dir ${_op_info})
         set(${_op_name}_apt_dir ${_op_info})
     endforeach()

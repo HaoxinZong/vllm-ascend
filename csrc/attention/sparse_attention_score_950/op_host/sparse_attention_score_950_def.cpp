@@ -12,9 +12,9 @@
 
 namespace ops {
 
-class SparseAttentionScore : public OpDef {
+class SparseAttentionScore950 : public OpDef {
 public:
-    explicit SparseAttentionScore(const char* name) : OpDef(name)
+    explicit SparseAttentionScore950(const char* name) : OpDef(name)
     {
         // dtype column mapping:
         //   col0: FP16 input  -> FP16 output
@@ -89,6 +89,6 @@ public:
     }
 };
 
-OP_ADD(SparseAttentionScore);
+OP_ADD(SparseAttentionScore950);
 
 }  // namespace ops

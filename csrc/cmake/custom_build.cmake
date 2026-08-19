@@ -750,7 +750,7 @@ install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
 # )
         
 foreach (op_dir ${OP_DIR_LIST})
-    resolve_op_build_name("${op_dir}" _op_name)
+    get_filename_component(_op_name "${op_dir}" NAME)
     set(CURRENT_KERNEL_DIR "${op_dir}/op_kernel")
     file(GLOB KERNEL_SUB_DIRS RELATIVE "${CURRENT_KERNEL_DIR}" "${CURRENT_KERNEL_DIR}/*")
     filter_copy_files(SELECTED_FILES SELECTED_DIRS)
