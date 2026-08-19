@@ -11,13 +11,13 @@ add_op_to_compiled_list()
 
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnnExc PRIVATE
-        sparse_attention_score950_def.cpp
+        sparse_attention_score_def.cpp
     )
 endif()
 
 if (BUILD_OPS_RTY_KERNEL)
     add_ops_compile_options(
-            OP_NAME SparseAttentionScore950
+            OP_NAME SparseAttentionScore
             OPTIONS --cce-auto-sync=off
                     -DASCENDC_DUMP=1
                     -Wno-deprecated-declarations
@@ -25,5 +25,5 @@ if (BUILD_OPS_RTY_KERNEL)
                     -fpermissive
     )
 else()
-    add_modules_sources(OPTYPE sparse_attention_score950 ACLNNTYPE aclnn_exclude)
+    add_modules_sources(OPTYPE sparse_attention_score ACLNNTYPE aclnn_exclude)
 endif()

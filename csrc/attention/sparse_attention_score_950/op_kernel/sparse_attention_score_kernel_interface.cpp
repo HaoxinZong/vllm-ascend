@@ -9,16 +9,16 @@
  */
 
 /*!
- * \file sparse_attention_score950_kernel_interface.cpp
+ * \file sparse_attention_score_kernel_interface.cpp
  * \brief Sparse Attention Score Kernel Interface
  */
 #include "kernel_operator.h"
 #if (__CCE_AICORE__ == 220)
-#include "arch22/sparse_attention_score950_kernel_arch22.h"
+#include "arch22/sparse_attention_score_kernel_arch22.h"
 #endif
 #if (__CCE_AICORE__ == 310)
-#include "arch35/sparse_attention_score950_kernel_arch35.h"
-#include "arch35/sparse_attention_score950_kernel_arch35_full_quant.h"
+#include "arch35/sparse_attention_score_kernel_arch35.h"
+#include "arch35/sparse_attention_score_kernel_arch35_full_quant.h"
 #endif
 
 using namespace NpuArch;

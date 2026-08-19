@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE950_TILING_H
-#define SPARSE_ATTENTION_SCORE950_TILING_H
+#ifndef SPARSE_ATTENTION_SCORE_TILING_H
+#define SPARSE_ATTENTION_SCORE_TILING_H
 
 #include <cstdint>
 #include <array>
@@ -60,7 +60,7 @@ constexpr uint64_t SASA_BF16_D128_ARCH22_NTD_TILING = SASA_BASE_ARCH22_TILING + 
 constexpr uint64_t SASA_FP16_D128_ARCH22_NTD_FD_TILING = SASA_BASE_ARCH22_TILING + 7;
 constexpr uint64_t SASA_BF16_D128_ARCH22_NTD_FD_TILING = SASA_BASE_ARCH22_TILING + 8;
 
-BEGIN_TILING_DATA_DEF(SparseAttentionScore950TilingData)
+BEGIN_TILING_DATA_DEF(SparseAttentionScoreTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batch);
 TILING_DATA_FIELD_DEF(uint32_t, numHeads);
 TILING_DATA_FIELD_DEF(uint32_t, kvHeads);
@@ -124,9 +124,9 @@ TILING_DATA_FIELD_DEF(uint64_t, fdIdentityOffset);
 TILING_DATA_FIELD_DEF(uint64_t, fdPartialLseOffset);
 TILING_DATA_FIELD_DEF(uint64_t, fdPartialOOffset);
 END_TILING_DATA_DEF;
-REGISTER_TILING_DATA_CLASS(SparseAttentionScore950, SparseAttentionScore950TilingData)
+REGISTER_TILING_DATA_CLASS(SparseAttentionScore, SparseAttentionScoreTilingData)
 
-struct SparseAttentionScore950CompileInfo {
+struct SparseAttentionScoreCompileInfo {
     uint32_t inputDataByte = 2;
     ge::DataType inputDataType;
     uint32_t coreNum = 0;
@@ -163,9 +163,9 @@ public:
     ~SASATiling() = default;
 
     ge::graphStatus GetTiling(gert::TilingContext *context,
-                              SparseAttentionScore950TilingData &tilingData);
+                              SparseAttentionScoreTilingData &tilingData);
     ge::graphStatus SetTilingData(gert::TilingContext *context,
-                                  SparseAttentionScore950TilingData &tilingData);
+                                  SparseAttentionScoreTilingData &tilingData);
 
 private:
     ge::graphStatus GetNpuInfo(gert::TilingContext *context);
@@ -239,9 +239,9 @@ private:
     ge::DataType dataType_ = ge::DT_FLOAT16;
     ge::DataType attentionOutDtype_ = ge::DT_FLOAT16;
 
-    SparseAttentionScore950TilingData *tilingData_ = nullptr;
+    SparseAttentionScoreTilingData *tilingData_ = nullptr;
 };
 
 }  // namespace optiling
 
-#endif  // SPARSE_ATTENTION_SCORE950_TILING_H
+#endif  // SPARSE_ATTENTION_SCORE_TILING_H

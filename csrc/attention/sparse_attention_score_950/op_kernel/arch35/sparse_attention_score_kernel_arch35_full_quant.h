@@ -8,12 +8,12 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE950_KERNEL_ARCH35_FULL_QUANT_H
-#define SPARSE_ATTENTION_SCORE950_KERNEL_ARCH35_FULL_QUANT_H
+#ifndef SPARSE_ATTENTION_SCORE_KERNEL_ARCH35_FULL_QUANT_H
+#define SPARSE_ATTENTION_SCORE_KERNEL_ARCH35_FULL_QUANT_H
 
 #include "kernel_utils.hpp"
 #include "../kernel_common.hpp"
-#include "sparse_attention_score950_fd_combine_arch35.h"
+#include "sparse_attention_score_fd_combine_arch35.h"
 
 using namespace NpuArch;
 using namespace tla;
@@ -61,8 +61,8 @@ public:
     __aicore__ inline
     void operator()(SasaFullQuantKernelParamsArch35 const &params)
     {
-        __gm__ SparseAttn::SparseAttentionScore950TilingData *sasaTilingData =
-            reinterpret_cast<__gm__ SparseAttn::SparseAttentionScore950TilingData *>(params.tiling);
+        __gm__ SparseAttn::SparseAttentionScoreTilingData *sasaTilingData =
+            reinterpret_cast<__gm__ SparseAttn::SparseAttentionScoreTilingData *>(params.tiling);
         FetchBaseShapeInfo(sasaTilingData);
         CalcOnChipBufTileInfo(sasaTilingData);
 
@@ -425,7 +425,7 @@ public:
         if constexpr (IS_FD) {
             AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-            SparseAttentionScore950FdCombineArch35<ElementO, Arch::Resource<ArchTag>> combine(resource);
+            SparseAttentionScoreFdCombineArch35<ElementO, Arch::Resource<ArchTag>> combine(resource);
             combine(sasaTilingData, gPartialLse, gPartialO, gO);
 #endif
         }
@@ -475,7 +475,7 @@ private:
     }
 
     __aicore__ inline
-    bool DenseCoreIntersectsBaseTask(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData,
+    bool DenseCoreIntersectsBaseTask(__gm__ SparseAttn::SparseAttentionScoreTilingData *tilingData,
                                      uint32_t coreIdx,
                                      uint32_t baseTask)
     {
@@ -489,7 +489,7 @@ private:
     }
 
     __aicore__ inline
-    void FetchBaseShapeInfo(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData)
+    void FetchBaseShapeInfo(__gm__ SparseAttn::SparseAttentionScoreTilingData *tilingData)
     {
         batch_ = tilingData->batch;
         qHeads_ = tilingData->numHeads;
@@ -517,7 +517,7 @@ private:
     }
 
     __aicore__ inline
-    void CalcOnChipBufTileInfo(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData)
+    void CalcOnChipBufTileInfo(__gm__ SparseAttn::SparseAttentionScoreTilingData *tilingData)
     {
         mm1L1TileM_ = tilingData->mm1L1TileM;
         mm1L1TileN_ = tilingData->mm1L1TileN;
@@ -739,4 +739,4 @@ private:
 
 }  // namespace SasaKernelArch35
 
-#endif  // SPARSE_ATTENTION_SCORE950_KERNEL_ARCH35_FULL_QUANT_H
+#endif  // SPARSE_ATTENTION_SCORE_KERNEL_ARCH35_FULL_QUANT_H

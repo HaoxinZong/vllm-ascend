@@ -1,8 +1,8 @@
-# SparseAttentionScore950 算子设计文档
+# SparseAttentionScore 算子设计文档
 
 ## 1. 算子功能概述
 
-`SparseAttentionScore950` 是面向 **Paged KV Cache + TopK Block Selection** 场景的稀疏注意力算子。它在 LLM 推理的 decode 阶段（以及小 batch prefill），根据预先选好的 TopK KV block indices，从 paged KV cache 中读取相关 block，完成 attention 计算。
+`SparseAttentionScore` 是面向 **Paged KV Cache + TopK Block Selection** 场景的稀疏注意力算子。它在 LLM 推理的 decode 阶段（以及小 batch prefill），根据预先选好的 TopK KV block indices，从 paged KV cache 中读取相关 block，完成 attention 计算。
 
 ### 核心计算
 
@@ -14,7 +14,7 @@ O = softmax(Q @ K^T / sqrt(d)) @ V
 
 ### 与 BlockSparseAttention (BSA) 的对比
 
-| 维度 | SparseAttentionScore950 (SASA) | BlockSparseAttention (BSA) |
+| 维度 | SparseAttentionScore (SASA) | BlockSparseAttention (BSA) |
 |------|---------------------------|---------------------------|
 | **稀疏模式输入** | `select_idx` + `select_num_idx`（预计算的 TopK block 编号列表） | `block_sparse_mask`（二维 0/1 mask 矩阵，kernel 内部转为 idx） |
 | **KV 存储格式** | Paged KV Cache: `[num_physical_blocks, block_size, kv_heads, D]` | 连续 KV: TND / BNSD / BSND |
@@ -235,7 +235,7 @@ KV 搬运减少 **4×**（= groupSize 倍），这是长 KV cache 场景下的�
 
 ### A5 (Ascend 950) 支持的模式
 
-SparseAttentionScore950 在 A5 (Ascend 950PR/950DT) 上 **仅支持 `inner_precise=4`**（默认值），对应混合精度模式 `LOW_HIGH_MIXED`。
+SparseAttentionScore 在 A5 (Ascend 950PR/950DT) 上 **仅支持 `inner_precise=4`**（默认值），对应混合精度模式 `LOW_HIGH_MIXED`。
 
 | inner_precise | 含义 | A5 支持 | A2/A3 支持 |
 |:---:|------|:---:|:---:|

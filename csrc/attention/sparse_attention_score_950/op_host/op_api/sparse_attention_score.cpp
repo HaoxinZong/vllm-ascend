@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "sparse_attention_score950.h"
+#include "sparse_attention_score.h"
 
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
@@ -17,9 +17,9 @@ using namespace op;
 
 namespace l0op {
 
-OP_TYPE_REGISTER(SparseAttentionScore950);
+OP_TYPE_REGISTER(SparseAttentionScore);
 
-const std::array<const aclTensor *, 2> SparseAttentionScore950(
+const std::array<const aclTensor *, 2> SparseAttentionScore(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -41,7 +41,7 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
     const aclTensor *attentionOut,
     aclOpExecutor *executor)
 {
-    L0_DFX(SparseAttentionScore950, query, key, value, selectIdx, blockTable,
+    L0_DFX(SparseAttentionScore, query, key, value, selectIdx, blockTable,
            selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
            qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional,
            numKeyValueHeads, scaleValue, blockSize, topK, innerPrecise,
@@ -56,7 +56,7 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
     auto attentionOutTensor = executor->AllocTensor(outDtype, Format::FORMAT_ND, Format::FORMAT_ND);
     auto softmaxLseTensor = executor->AllocTensor(DataType::DT_FLOAT, Format::FORMAT_ND, Format::FORMAT_ND);
 
-    auto ret = INFER_SHAPE(SparseAttentionScore950,
+    auto ret = INFER_SHAPE(SparseAttentionScore,
                            OP_INPUT(query, key, value, selectIdx, blockTable,
                                     selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
                                     qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional),
@@ -69,11 +69,11 @@ const std::array<const aclTensor *, 2> SparseAttentionScore950(
                                    inputLayout,
                                    isDense));
     if (ret != ACLNN_SUCCESS) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "SparseAttentionScore950 infer shape failed.");
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "SparseAttentionScore infer shape failed.");
         return {nullptr, nullptr};
     }
 
-    ADD_TO_LAUNCHER_LIST_AICORE(SparseAttentionScore950,
+    ADD_TO_LAUNCHER_LIST_AICORE(SparseAttentionScore,
                                 OP_INPUT(query, key, value, selectIdx, blockTable,
                                          selectNumIdxOptional, actualSeqLengthsOptional, actualSeqLengthsKvOptional,
                                          qDequantScaleOptional, kDequantScaleOptional, vDequantScaleOptional),

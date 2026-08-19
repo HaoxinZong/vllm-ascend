@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H
-#define SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H
+#ifndef SPARSE_ATTENTION_SCORE_FD_COMBINE_ARCH35_H
+#define SPARSE_ATTENTION_SCORE_FD_COMBINE_ARCH35_H
 
 #include <limits>
 #include "kernel_operator.h"
@@ -18,7 +18,7 @@
 namespace SasaKernelArch35 {
 
 template <class ElementO, class Resource>
-class SparseAttentionScore950FdCombineArch35 {
+class SparseAttentionScoreFdCombineArch35 {
 public:
     static constexpr uint32_t MAX_SPLIT_NUM = SparseAttn::SASA_FD_MAX_AIC;
     static constexpr uint32_t MAX_ROW_TILE = 8;
@@ -28,7 +28,7 @@ public:
     static constexpr uint32_t MAX_O_TILE_ELEMS = MAX_ROW_TILE * HEAD_DIM;
 
     __aicore__ inline
-    SparseAttentionScore950FdCombineArch35(Resource &resource)
+    SparseAttentionScoreFdCombineArch35(Resource &resource)
     {
         constexpr uint32_t LSE_OFFSET = 0;
         constexpr uint32_t LSE_BROADCAST_OFFSET = LSE_OFFSET + MAX_LSE_ELEMS * sizeof(float);
@@ -53,7 +53,7 @@ public:
     }
 
     __aicore__ inline
-    void operator()(__gm__ SparseAttn::SparseAttentionScore950TilingData *tilingData,
+    void operator()(__gm__ SparseAttn::SparseAttentionScoreTilingData *tilingData,
                     AscendC::GlobalTensor<float> &gPartialLse,
                     AscendC::GlobalTensor<float> &gPartialO,
                     AscendC::GlobalTensor<ElementO> &gO)
@@ -262,4 +262,4 @@ private:
 
 }  // namespace SasaKernelArch35
 
-#endif  // SPARSE_ATTENTION_SCORE950_FD_COMBINE_ARCH35_H
+#endif  // SPARSE_ATTENTION_SCORE_FD_COMBINE_ARCH35_H
