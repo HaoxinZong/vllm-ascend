@@ -50,16 +50,16 @@ public:
         constexpr uint32_t MASK_PAT_IN_FP32 = 4 * PRE_ELEM_NUM_PER_LOOP; // 2(db)+2
         constexpr uint32_t MASK_PAT_IN_BIT = 8 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4
         constexpr uint32_t MASK_IDX = 9 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4+1
-        constexpr uint32_t RSVD_SPARSE_IDX = 13 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4+1+4
-        constexpr uint32_t RSVD_SPARSE_COUNT = 21 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4+1+4+8(db)
+        constexpr uint32_t SPARSE_IDX = 13 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4+1+4
+        constexpr uint32_t SPARSE_COUNT = 21 * PRE_ELEM_NUM_PER_LOOP; // 1+2+4+1+4+8(db)
 
         for (uint32_t i = 0; i < IO_STAGES; i++) {
             maskPatUb8[i] = resource.ubBuf.template GetBufferByByte<ElementSparseMask>(
                 MASK_PAT_IN_UINT8 + i * PRE_ELEM_NUM_PER_LOOP * sizeof(ElementSparseMask));
             sparseIdxUb[i] = resource.ubBuf.template GetBufferByByte<ElementSparseIdx>(
-                RSVD_SPARSE_IDX + i * PRE_ELEM_NUM_PER_LOOP * sizeof(ElementSparseIdx));
+                SPARSE_IDX + i * PRE_ELEM_NUM_PER_LOOP * sizeof(ElementSparseIdx));
             sparseCountUb[i] = resource.ubBuf.template GetBufferByByte<ElementSparseCount>(
-                RSVD_SPARSE_COUNT + i * PRE_ROW_TILE * sizeof(ElementSparseCount));
+                SPARSE_COUNT + i * PRE_ROW_TILE * sizeof(ElementSparseCount));
         }
         maskPatUb16 = resource.ubBuf.template GetBufferByByte<half>(MASK_PAT_IN_FP16);
         maskPatUb32 = resource.ubBuf.template GetBufferByByte<float>(MASK_PAT_IN_FP32);
@@ -93,8 +93,8 @@ public:
                 uint32_t globalRowOffset = curSubCoreRowOffset + curLoopRowOffset;
                 uint32_t actDealtRowCurLoop = (i == rowLoop - 1) ? (actDealtRow - curLoopRowOffset) : PRE_ROW_TILE;
 
-                uint64_t rsvdCountPerRow[PRE_ROW_TILE] = {0};
-                uint64_t rsvdCountPerRowCurColLoop[PRE_ROW_TILE] = {0};
+                uint64_t sparseCountPerRow[PRE_ROW_TILE] = {0};
+                uint64_t sparseCountPerRowCurColLoop[PRE_ROW_TILE] = {0};
                 for (uint32_t j = 0; j < colLoop; j++) {
                     uint32_t curLoopColOffset = j * PRE_COL_TILE;
                     uint32_t actDealtColCurLoop =
@@ -139,7 +139,7 @@ public:
                             sparseIdxUb[IdxPingPongFlag][k * PRE_COL_TILE],
                             maskIdxUb,
                             maskPatInBitUb32[k * PRE_COL_TILE / 4],
-                            true, actDealtColCurLoop, {1, 1, 0, 0}, rsvdCountPerRowCurColLoop[k]);
+                            true, actDealtColCurLoop, {1, 1, 0, 0}, sparseCountPerRowCurColLoop[k]);
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
 
 
@@ -150,17 +150,17 @@ public:
                         AscendC::DataCopyPad(
                             gSparseIdx[
                                 globalRowOffset * yBlockNumAligned + k * yBlockNumAligned +
-                                rsvdCountPerRow[k]],
+                                sparseCountPerRow[k]],
                             sparseIdxUb[IdxPingPongFlag][k * PRE_COL_TILE],
                             AscendC::DataCopyExtParams(
-                                1, rsvdCountPerRowCurColLoop[k] * sizeof(ElementSparseIdx), 0, 0, 0));
+                                1, sparseCountPerRowCurColLoop[k] * sizeof(ElementSparseIdx), 0, 0, 0));
                         if (k == actDealtRowCurLoop - 1) {
                             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(IdxPingPongFlag);
                         }
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
 
                         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
-                        rsvdCountPerRow[k] += rsvdCountPerRowCurColLoop[k];
+                        sparseCountPerRow[k] += sparseCountPerRowCurColLoop[k];
                         if (k == actDealtRowCurLoop - 1) {
                             AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
                         }
@@ -169,7 +169,7 @@ public:
                 }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(CountPingPongFlag);
                 for (uint32_t k = 0; k < actDealtRowCurLoop; k++) {
-                    sparseCountUb[CountPingPongFlag].SetValue(k, static_cast<int32_t>(rsvdCountPerRow[k]));
+                    sparseCountUb[CountPingPongFlag].SetValue(k, static_cast<int32_t>(sparseCountPerRow[k]));
                 }
                 AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(CountPingPongFlag + 2);
                 AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(CountPingPongFlag + 2);

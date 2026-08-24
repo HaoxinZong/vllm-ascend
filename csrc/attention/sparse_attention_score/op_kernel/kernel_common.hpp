@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -13,24 +13,24 @@
 
 #include "kernel_operator.h"
 
-namespace SparseAttn {
+namespace GenericBlockSparseAttn {
 
-constexpr uint32_t SASA_FD_MAX_AIC = 32;
-constexpr uint32_t SASA_FD_MAX_BASE_TASK = 32;
-
-struct SparseAttentionScoreTilingData {
+// Kernel-side mirror of GenericBlockSparseAttentionTilingData (host tiling).
+// Field order must match BEGIN_TILING_DATA_DEF in generic_block_sparse_attention_tiling.h.
+struct GenericBlockSparseAttentionTilingData {
     uint32_t batch;
     uint32_t numHeads;
     uint32_t kvHeads;
     uint32_t embeddingSize;
-    uint32_t blockSize;
-    uint32_t topK;
+    uint32_t blockShapeX;   // Q sparse block size (default 128)
+    uint32_t blockShapeY;   // KV sparse block size (default 128)
+    uint32_t blockSize;     // Paged KV cache block size, parsed from KV tensor shape
+    uint32_t topK;          // sparseBlockIdx dim-3 (KVb): selected KV blocks per Q block
+    uint32_t qBlockNum;     // sparseBlockIdx dim-2 (Qb): ceilDiv(maxQSeqlen, blockShapeX)
     uint32_t maxBlocksPerBatch;
     uint32_t totalQTokens;
-    uint32_t totalTaskNum;
-    uint32_t firstBatchTaskNum;
     float scaleValue;
-    uint32_t innerPrecise;
+    uint32_t softmaxPrecision;
     uint32_t maxQSeqlen;
     uint64_t mm1OutSize;
     uint64_t smOnlineOutSize;
@@ -55,21 +55,16 @@ struct SparseAttentionScoreTilingData {
     uint32_t kL1BufNum;
     uint32_t vL1BufNum;
     uint32_t pL1BufNum;
+    // PAGED_BBND page base stride in elements (dim0). Allows first-axis non-contiguous KV cache.
+    uint64_t kStride0;
+    uint64_t vStride0;
+    uint32_t fdStaticEnabled;
     uint32_t fdLseSubStride;
-    // FD core-range metadata.
-    uint32_t fdCorePerCoreTaskNum;
-    uint32_t fdCoreTaskStart[SASA_FD_MAX_AIC];
-    uint32_t fdCoreTaskEnd[SASA_FD_MAX_AIC];
-    // FD combine-range metadata.
-    uint32_t fdCombineTaskNum;
-    uint32_t fdCombineBaseTask[SASA_FD_MAX_BASE_TASK];
-    uint32_t fdPartialStartByBase[SASA_FD_MAX_BASE_TASK];
-    uint32_t fdPartialCountByBase[SASA_FD_MAX_BASE_TASK];
-    uint64_t fdIdentityOffset;
+    uint32_t fdPartialCapacity;
     uint64_t fdPartialLseOffset;
     uint64_t fdPartialOOffset;
 };
 
-}  // namespace SparseAttn
+}  // namespace GenericBlockSparseAttn
 
 #endif  // KERNEL_COMMON_HPP

@@ -92,13 +92,14 @@ public:
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
         maskUbTensor16 = resource.ubBuf.template GetBufferByByte<half>(MASK16_UB_TENSOR_OFFSET);
+        // Align arch35 low-prec: S/P/lm/ll/hm half; gm/dm/gl float for shared float RescaleO.
         lmUbTensor = resource.ubBuf.template GetBufferByByte<half>(LM_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<half>(HM_UB_TENSOR_OFFSET);
-        gmUbTensor = resource.ubBuf.template GetBufferByByte<half>(GM_UB_TENSOR_OFFSET);
-        dmUbTensor = resource.ubBuf.template GetBufferByByte<half>(DM_UB_TENSOR_OFFSET);
+        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
+        dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
         llUbTensor = resource.ubBuf.template GetBufferByByte<half>(LL_UB_TENSOR_OFFSET);
         tvUbTensor = resource.ubBuf.template GetBufferByByte<half>(TV_UB_TENSOR_OFFSET);
-        glUbTensor = resource.ubBuf.template GetBufferByByte<half>(GL_UB_TENSOR_OFFSET);
+        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
     }
 
     __aicore__ inline
@@ -119,6 +120,25 @@ public:
             AscendC::SetVectorMask<int8_t>(0x0, ((uint64_t)1 << lowMask) - 1);
         } else {
             AscendC::SetVectorMask<int8_t>(((uint64_t)1 << highMask) - 1, 0xffffffffffffffff);
+        }
+    }
+
+    // Mask for float gm/dm/gl vector ops (same as float Softmax).
+    __aicore__ inline
+    void SetFloatVecMask(int32_t len)
+    {
+        uint64_t mask = 0;
+        uint64_t one = 1;
+        uint64_t temp = static_cast<uint64_t>(len) % static_cast<uint64_t>(FLOAT_VECTOR_SIZE);
+        for (uint64_t i = 0; i < temp; i++) {
+            mask |= one << i;
+        }
+        if (len == VECTOR_SIZE || len == 0) {
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        } else if (len >= static_cast<int32_t>(FLOAT_VECTOR_SIZE)) {
+            AscendC::SetVectorMask<int8_t>(mask, (uint64_t)-1);
+        } else {
+            AscendC::SetVectorMask<int8_t>(0x0, mask);
         }
     }
 
@@ -554,47 +574,57 @@ public:
     void UpdateGlobalRowMax(uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound, uint32_t columnNum,
         uint32_t columnNumRound, uint32_t dmUbOffsetCurCycle, uint32_t rowOffset, uint32_t isFirstStackTile)
     {
+        // tv reused as float scratch for half↔float (overwritten by CalcExp Brcb afterwards).
+        AscendC::LocalTensor<float> tvF = tvUbTensor.template ReinterpretCast<float>();
         if (isFirstStackTile) {
             AscendC::DataCopy(
                 hmUbTensor[rowOffset],
                 lmUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / BLOCK_SIZE, 0, 0));
             AscendC::PipeBarrier<PIPE_V>();
+            // *** gm(float) = cast(hm)
+            AscendC::Cast(gmUbTensor[rowOffset], hmUbTensor[rowOffset],
+                AscendC::RoundMode::CAST_NONE, rowNumCurLoopRound);
+            AscendC::PipeBarrier<PIPE_V>();
         } else {
-            SetVecMask(rowNumCurLoop);
-            // *** hm = vmax(lm, gm)
-            AscendC::Max<half, false>(
-                hmUbTensor[rowOffset],
-                lmUbTensor[rowOffset],
+            // *** hm_f = cast(lm); hm_f = max(hm_f, gm); dm = exp(gm - hm_f); hm/gm = hm_f
+            AscendC::Cast(tvF[rowOffset], lmUbTensor[rowOffset],
+                AscendC::RoundMode::CAST_NONE, rowNumCurLoopRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            SetFloatVecMask(rowNumCurLoop);
+            AscendC::Max<float, false>(
+                tvF[rowOffset],
+                tvF[rowOffset],
                 gmUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-
             AscendC::PipeBarrier<PIPE_V>();
-            // *** dm = gm - hm
-            AscendC::Sub<half, false>(
+            AscendC::Sub<float, false>(
                 dmUbTensor[dmUbOffsetCurCycle],
                 gmUbTensor[rowOffset],
-                hmUbTensor[rowOffset],
+                tvF[rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
-            // *** dm = exp(dm)
-            AscendC::Exp<half, false>(dmUbTensor[dmUbOffsetCurCycle],
+            AscendC::Exp<float, false>(
+                dmUbTensor[dmUbOffsetCurCycle],
                 dmUbTensor[dmUbOffsetCurCycle],
                 (uint64_t)0,
                 1,
                 AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(hmUbTensor[rowOffset], tvF[rowOffset],
+                AscendC::RoundMode::CAST_NONE, rowNumCurLoopRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::DataCopy(
+                gmUbTensor[rowOffset],
+                tvF[rowOffset],
+                AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::PipeBarrier<PIPE_V>();
         }
-        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-        AscendC::PipeBarrier<PIPE_V>();
-        // *** gm = hm
-        AscendC::DataCopy(gmUbTensor[rowOffset],
-            hmUbTensor[rowOffset],
-            AscendC::DataCopyParams(1, rowNumCurLoopRound / BLOCK_SIZE, 0, 0));
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline
@@ -678,17 +708,16 @@ public:
     void UpdateGlobalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound,
         uint32_t dmUbOffsetCurCycle, uint32_t rowOffset, uint32_t isFirstStackTile)
     {
+        AscendC::LocalTensor<float> tvF = tvUbTensor.template ReinterpretCast<float>();
         if (isFirstStackTile) {
-            // *** gl = ll
-            AscendC::DataCopy(
-                glUbTensor[rowOffset],
-                llUbTensor[rowOffset],
-                AscendC::DataCopyParams(1, rowNumCurLoopRound / BLOCK_SIZE, 0, 0));
+            // *** gl(float) = cast(ll)
+            AscendC::Cast(glUbTensor[rowOffset], llUbTensor[rowOffset],
+                AscendC::RoundMode::CAST_NONE, rowNumCurLoopRound);
             AscendC::PipeBarrier<PIPE_V>();
         } else {
-            SetVecMask(rowNumCurLoop);
+            SetFloatVecMask(rowNumCurLoop);
             // *** gl = dm * gl
-            AscendC::Mul<half, false>(
+            AscendC::Mul<float, false>(
                 glUbTensor[rowOffset],
                 dmUbTensor[dmUbOffsetCurCycle],
                 glUbTensor[rowOffset],
@@ -696,11 +725,16 @@ public:
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
-            // *** gl = ll + gl
-            AscendC::Add<half, false>(
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+            AscendC::Cast(tvF[rowOffset], llUbTensor[rowOffset],
+                AscendC::RoundMode::CAST_NONE, rowNumCurLoopRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            SetFloatVecMask(rowNumCurLoop);
+            // *** gl = gl + cast(ll)
+            AscendC::Add<float, false>(
                 glUbTensor[rowOffset],
                 glUbTensor[rowOffset],
-                llUbTensor[rowOffset],
+                tvF[rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -735,8 +769,10 @@ public:
         AscendC::GlobalTensor<ElementOutput> gOutput, const LayoutOutput &layoutOutput,
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isFirstRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, Arch::CrossCoreFlag softmaxFlag, uint32_t isLastLoop)
+        uint32_t curStackTileMod, Arch::CrossCoreFlag softmaxFlag, uint32_t isLastLoop,
+        uint32_t isLastStackTile)
     {
+        (void)isLastStackTile;
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, BLOCK_SIZE);
         uint32_t columnNum = layoutOutput.shape(1);
@@ -771,11 +807,11 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
+        UpdateGlobalRowSum(
+            sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, rowOffset, isFirstStackTile);
         if (isLastLoop) {
             NpuArch::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxFlag);
         }
-        UpdateGlobalRowSum(
-            sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, rowOffset, isFirstStackTile);
     }
 
     __aicore__ inline
@@ -838,7 +874,8 @@ public:
                 pingpongFlag,
                 curStackTileMod,
                 softmaxFlag,
-                (rowLoopIdx == rowLoopNum - 1));
+                (rowLoopIdx == rowLoopNum - 1),
+                isLastNoMaskStackTile);
         }
     }
 
@@ -959,6 +996,7 @@ public:
                 pingpongFlag,
                 curStackTileMod,
                 softmaxFlag,
+                0,
                 0);
         }
     }
@@ -972,11 +1010,11 @@ private:
     AscendC::LocalTensor<half> maskUbTensor16;
     AscendC::LocalTensor<half> lmUbTensor;
     AscendC::LocalTensor<half> hmUbTensor;
-    AscendC::LocalTensor<half> gmUbTensor;
-    AscendC::LocalTensor<half> dmUbTensor;
+    AscendC::LocalTensor<float> gmUbTensor;
+    AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<half> llUbTensor;
     AscendC::LocalTensor<half> tvUbTensor;
-    AscendC::LocalTensor<half> glUbTensor;
+    AscendC::LocalTensor<float> glUbTensor;
 };
 }
 

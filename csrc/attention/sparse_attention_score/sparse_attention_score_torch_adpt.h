@@ -16,6 +16,8 @@
 #ifndef SPARSE_ATTENTION_SCORE_TORCH_ADPT_H
 #define SPARSE_ATTENTION_SCORE_TORCH_ADPT_H
 
+#include <array>
+
 namespace vllm_ascend {
 
 namespace {
@@ -32,6 +34,7 @@ constexpr int64_t SELECT_IDX_DIM_NUM = 3;
 constexpr int64_t SELECT_NUM_IDX_DIM_NUM = 2;
 constexpr int64_t BLOCK_TABLE_DIM_NUM = 2;
 constexpr int64_t DEQUANT_SCALE_DIM_NUM = 4;
+constexpr int64_t GBSA_METADATA_SIZE = 1024;
 
 void CheckFp8Tensor(const at::Tensor &tensor, const char *name)
 {
@@ -61,6 +64,15 @@ void CheckBlockedKvTensor(const at::Tensor &tensor, const char *name)
     TORCH_CHECK(tensor.numel() > 0, name, " should not be empty.");
 }
 
+void CheckSeqTensor(const c10::optional<at::Tensor> &tensor, const char *name,
+                    at::ScalarType dtype, int64_t expectedSize)
+{
+    TORCH_CHECK(tensor.has_value() && tensor.value().defined(), name, " must be provided.");
+    TORCH_CHECK(tensor.value().dim() == 1, name, " must be a 1D tensor.");
+    TORCH_CHECK(tensor.value().scalar_type() == dtype, name, " has an invalid dtype.");
+    TORCH_CHECK(tensor.value().size(0) == expectedSize, name, " has an invalid length.");
+}
+
 void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
                  const at::Tensor &selectIdx, const at::Tensor &blockTable,
                  const c10::optional<at::Tensor> &selectNumIdx,
@@ -69,7 +81,10 @@ void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tenso
                  const c10::optional<at::Tensor> &vDequantScale,
                  const c10::optional<at::Tensor> &actualSeqLengths,
                  const c10::optional<at::Tensor> &actualSeqLengthsKv,
-                 int64_t numKeyValueHeads, int64_t blockSize, int64_t topK, int64_t innerPrecise)
+                 const c10::optional<at::Tensor> &cuSeqLengthsQ,
+                 const c10::optional<at::Tensor> &cuSeqLengthsKv,
+                 int64_t numKeyValueHeads, int64_t blockSize, int64_t topK,
+                 int64_t innerPrecise, int64_t softmaxPrecision)
 {
     const bool isFp8 = query.scalar_type() == at::kFloat8_e4m3fn;
     if (isFp8) {
@@ -90,8 +105,10 @@ void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tenso
     CheckBlockedKvTensor(value, "value");
 
     TORCH_CHECK(selectIdx.dim() == SELECT_IDX_DIM_NUM,
-                "select_idx must be [KVHead, maxQSeqlen, TopK], but got dim ", selectIdx.dim());
+                "select_idx must be [KVHead, totalQBlocks, TopK], but got dim ", selectIdx.dim());
     TORCH_CHECK(selectIdx.scalar_type() == at::kInt, "select_idx dtype must be int32.");
+    TORCH_CHECK(selectIdx.size(1) == query.size(DIM_T),
+                "select_idx totalQBlocks must equal the number of query tokens when blockShapeX is 1.");
 
     TORCH_CHECK(blockTable.dim() == BLOCK_TABLE_DIM_NUM,
                 "block_table must be [batch, maxBlocksPerBatch], but got dim ", blockTable.dim());
@@ -110,19 +127,25 @@ void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tenso
                     query.size(DIM_D) == value.size(DIM_KV_HEAD_SIZE),
                 "query/key/value D dim must be equal.");
     TORCH_CHECK(blockSize > 0, "block_size must be positive.");
-    TORCH_CHECK(topK > 0, "top_k must be positive.");
+    TORCH_CHECK(topK > 0 && topK <= 16, "top_k must be in [1, 16].");
+    TORCH_CHECK(selectIdx.size(2) == topK, "select_idx last dim must match top_k.");
+    TORCH_CHECK(softmaxPrecision == 0 || softmaxPrecision == 1,
+                "softmax_precision must be 0 or 1.");
 
-    if (selectNumIdx.has_value() && selectNumIdx.value().defined()) {
-        const at::Tensor &snIdx = selectNumIdx.value();
-        TORCH_CHECK(snIdx.dim() == SELECT_NUM_IDX_DIM_NUM,
-                    "select_num_idx must be [KVHead, maxQSeqlen].");
-        TORCH_CHECK(snIdx.scalar_type() == at::kInt, "select_num_idx dtype must be int32.");
-    }
+    TORCH_CHECK(selectNumIdx.has_value() && selectNumIdx.value().defined(),
+                "select_num_idx must be provided for GenericBlockSparseAttention.");
+    const at::Tensor &snIdx = selectNumIdx.value();
+    TORCH_CHECK(snIdx.dim() == SELECT_NUM_IDX_DIM_NUM,
+                "select_num_idx must be [KVHead, totalQBlocks].");
+    TORCH_CHECK(snIdx.scalar_type() == at::kInt, "select_num_idx dtype must be int32.");
+    TORCH_CHECK(snIdx.size(0) == selectIdx.size(0) && snIdx.size(1) == selectIdx.size(1),
+                "select_num_idx shape must match select_idx without its last dim.");
 
-    TORCH_CHECK(actualSeqLengths.has_value() && actualSeqLengths.value().defined(),
-                "actual_seq_lengths must be provided.");
-    TORCH_CHECK(actualSeqLengthsKv.has_value() && actualSeqLengthsKv.value().defined(),
-                "actual_seq_lengths_kv must be provided.");
+    const int64_t batch = blockTable.size(0);
+    CheckSeqTensor(actualSeqLengths, "actual_seq_lengths", at::kInt, batch);
+    CheckSeqTensor(actualSeqLengthsKv, "actual_seq_lengths_kv", at::kInt, batch);
+    CheckSeqTensor(cuSeqLengthsQ, "cu_seq_lengths_q", at::kLong, batch + 1);
+    CheckSeqTensor(cuSeqLengthsKv, "cu_seq_lengths_kv", at::kLong, batch + 1);
 }
 
 }  // namespace
@@ -136,27 +159,66 @@ at::Tensor npu_sparse_attention_score(
     const c10::optional<at::Tensor> &vDequantScale,
     const c10::optional<at::Tensor> &actualSeqLengths,
     const c10::optional<at::Tensor> &actualSeqLengthsKv,
+    const c10::optional<at::Tensor> &cuSeqLengthsQ,
+    const c10::optional<at::Tensor> &cuSeqLengthsKv,
     c10::string_view qInputLayout, c10::string_view kvInputLayout,
     int64_t numKeyValueHeads, double scaleValue, int64_t blockSize, int64_t topK,
-    int64_t innerPrecise)
+    int64_t innerPrecise, int64_t softmaxPrecision)
 {
     TORCH_CHECK(std::string(qInputLayout) == "TND",
                 "npu_sparse_attention_score only supports query TND layout");
+    TORCH_CHECK(std::string(kvInputLayout) == "PAGED_BBND",
+                "npu_sparse_attention_score only supports PAGED_BBND KV layout");
     CheckParams(query, key, value, selectIdx, blockTable, selectNumIdx,
                 qDequantScale, kDequantScale, vDequantScale,
-                actualSeqLengths, actualSeqLengthsKv, numKeyValueHeads, blockSize, topK, innerPrecise);
+                actualSeqLengths, actualSeqLengthsKv, cuSeqLengthsQ, cuSeqLengthsKv,
+                numKeyValueHeads, blockSize, topK, innerPrecise, softmaxPrecision);
 
-    at::ScalarType outDtype = (query.scalar_type() == at::kFloat8_e4m3fn)
+    const at::Tensor &sparseBlockCount = selectNumIdx.value();
+    const at::Tensor &seqUsedQ = actualSeqLengths.value();
+    const at::Tensor &seqUsedKv = actualSeqLengthsKv.value();
+    const at::Tensor &cuQ = cuSeqLengthsQ.value();
+    const at::Tensor &cuKv = cuSeqLengthsKv.value();
+    at::Tensor metadata = at::empty({GBSA_METADATA_SIZE}, selectIdx.options().dtype(at::kInt));
+
+    std::array<int64_t, 2> blockShapeStorage{1, blockSize};
+    at::IntArrayRef blockShape(blockShapeStorage);
+    std::string layoutQStr("TND");
+    std::string layoutKvStr("PAGED_BBND");
+    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
+    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+    const int64_t maxQSeqLen = selectIdx.size(1);
+    const int64_t maxKvSeqLen = blockTable.size(1) * blockSize;
+    const int64_t numQHeads = query.size(DIM_N);
+    const int64_t headDim = query.size(DIM_D);
+    const int64_t isPackedGqa = 1;
+    const int64_t maskType = 1;
+    const int64_t quantType = query.scalar_type() == at::kFloat8_e4m3fn ? 5 : 0;
+    const int64_t winLeft = -1;
+    const int64_t winRight = -1;
+
+    EXEC_NPU_CMD(aclnnGenericBlockSparseAttentionMetadata,
+                 selectIdx, sparseBlockCount, cuQ, cuKv, seqUsedQ, seqUsedKv,
+                 maxQSeqLen, maxKvSeqLen, numQHeads, numKeyValueHeads, headDim,
+                 blockShape, isPackedGqa, layoutQPtr, layoutKvPtr, maskType,
+                 quantType, softmaxPrecision, winLeft, winRight, metadata);
+
+    at::ScalarType outDtype = query.scalar_type() == at::kFloat8_e4m3fn
                                   ? at::kHalf
                                   : query.scalar_type();
     at::Tensor attentionOut = at::empty(query.sizes(), query.options().dtype(outDtype));
-    at::Tensor softmaxLse;
+    at::Tensor softmaxLse = at::empty({0}, query.options().dtype(at::kFloat));
+    const c10::optional<at::Tensor> noTensor = c10::nullopt;
+    const int64_t returnSoftmaxLse = 0;
+    const double dstTypeMax = 0.0;
 
-    EXEC_NPU_CMD(aclnnSparseAttentionScore, query, key, value, selectIdx, blockTable,
-                 selectNumIdx, actualSeqLengths, actualSeqLengthsKv,
-                 qDequantScale, kDequantScale, vDequantScale,
-                 numKeyValueHeads, scaleValue, blockSize, topK, innerPrecise,
-                 attentionOut, softmaxLse);
+    EXEC_NPU_CMD(aclnnGenericBlockSparseAttention,
+                 query, key, value, selectIdx, sparseBlockCount, metadata,
+                 noTensor, qDequantScale, kDequantScale, vDequantScale, noTensor,
+                 cuQ, cuKv, seqUsedQ, seqUsedKv, blockTable, blockShape,
+                 isPackedGqa, layoutQPtr, layoutKvPtr, scaleValue, maskType,
+                 quantType, dstTypeMax, softmaxPrecision, winLeft, winRight,
+                 returnSoftmaxLse, attentionOut, softmaxLse);
 
     return attentionOut;
 }

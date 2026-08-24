@@ -291,6 +291,8 @@ public:
                 const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
                 const uint64_t lseOffset = static_cast<uint64_t>(fdTaskId) * 2 * fdLseSubStride +
                     subBlockIdx * fdLseSubStride + rowOffsetLoop;
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                 AscendC::DataCopyPad(gPartialLse[lseOffset], lse32_ubuf_tensor[rowOffsetLoop],
                     AscendC::DataCopyExtParams(1, curRowNum * sizeof(float), 0, 0, 0));
                 // Wait for partial writes before reusing the Vector UB.
@@ -554,8 +556,42 @@ public:
         AscendC::DataCopy(gPartialO[oOffset], goUbTensor32, rowNum * colNum);
         const uint64_t lseOffset = static_cast<uint64_t>(fdTaskId) * 2 * fdLseSubStride +
             subBlockIdx * fdLseSubStride;
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::DataCopyPad(gPartialLse[lseOffset], lse32_ubuf_tensor,
             AscendC::DataCopyExtParams(1, rowNum * sizeof(float), 0, 0, 0));
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+    }
+
+    __aicore__ inline
+    void WriteEmptyOutput(AscendC::GlobalTensor<ElementOutput> gOutput,
+                          AscendC::GlobalTensor<ElementLse> gLse,
+                          uint32_t groupSize,
+                          uint32_t embed)
+    {
+        const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t rowSplit = groupSize == 1U ? 0U : groupSize / AscendC::GetSubBlockNum();
+        const uint32_t rowNum = subBlockIdx == 0U ? rowSplit : groupSize - rowSplit;
+        const uint32_t rowOffset = subBlockIdx == 0U ? 0U : rowSplit;
+        if (rowNum == 0U) {
+            return;
+        }
+        AscendC::Duplicate(goUbTensor16, static_cast<ElementOutput>(0), rowNum * embed);
+        if constexpr (LSE_MODE == LseMode::OUT_ONLY) {
+            AscendC::Duplicate(lse32_ubuf_tensor, -3.402823466e+38F, RoundUp(rowNum, FLOAT_BLOCK_SIZE));
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::DataCopyPad(gOutput[static_cast<uint64_t>(rowOffset) * embed], goUbTensor16,
+            AscendC::DataCopyExtParams(rowNum, embed * sizeof(ElementOutput), 0, 0, 0));
+        if constexpr (LSE_MODE == LseMode::OUT_ONLY) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::DataCopyPad(gLse[rowOffset], lse32_ubuf_tensor,
+                AscendC::DataCopyExtParams(1, rowNum * sizeof(float), 0, 0, 0));
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
     }

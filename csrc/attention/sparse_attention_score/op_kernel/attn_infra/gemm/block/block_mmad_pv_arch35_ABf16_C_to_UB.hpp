@@ -10,9 +10,9 @@
 
 /**
  * @brief matmul implementation for single p&v base tile
- * This implementation is designed for the following scenario:
+ * This implementation is designed for the following senario:
  * A full p base tile is loaded to L1 from UB, no workspace transit
- * A full v base tile is loaded to L1 from GM，relevant instructions launched before p base tile crossCore wait
+ * A full v base tile is loaded to L1 from GM，relavent instructions launched before p base tile crossCore wait
  * A full p*v base tile is loaded to UB from l0C, no workspace transit
  */
 #ifndef GEMM_BLOCK_PV_ARCH35_ABF16_C2UB_HPP
@@ -150,7 +150,7 @@ public:
     __aicore__ inline
     void SetCrossCoreSync(Arch::CrossCoreFlag &crossCoreFlag)
     {
-        // in mode 4, AIC set for 2 AIVs separately
+        // in mode 4, AIC set for 2 AIVs seperately
         if constexpr (MODE == 4U) {
             uint16_t flagIdV0 = crossCoreFlag.id;
             uint16_t flagIdV1 = flagIdV0 + V0_V1_FLAG_ID_OFFSET;
@@ -164,7 +164,7 @@ public:
     __aicore__ inline
     void WaitCrossCoreSync(Arch::CrossCoreFlag &crossCoreFlag)
     {
-        // in mode 4, AIC wait for 2 AIVs separately
+        // in mode 4, AIC wait for 2 AIVs seperately
         if constexpr (MODE == 4U) {
             uint16_t flagIdV0 = crossCoreFlag.id;
             uint16_t flagIdV1 = flagIdV0 + V0_V1_FLAG_ID_OFFSET;
@@ -186,7 +186,7 @@ public:
                                    AscendC::GlobalTensor<int32_t> gSparseBlockIdx,
                                    uint32_t gatheredKvSTileIdx, uint32_t kvSeqlen,
                                    uint32_t kvSBaseTile, uint32_t blockShapeY,
-                                   uint32_t yBlockNumAval, uint32_t yBlockNumRsvd,
+                                   uint32_t yBlockNumAval, uint32_t yBlockNumSparse,
                                    uint32_t curBaseTileSize, uint32_t embed)
     {
         using CopyGmToL1B = typename TileCopy_::template CopyGmToL1B<TensorB>;
@@ -207,7 +207,7 @@ public:
         // 逐稀疏block搬移填充基本块过程中，已处理的累积序列长度
         uint32_t dealtLenAccum = 0;
 
-        while (dealtLenAccum < curBaseTileSize && gatheredYBlockIdx < yBlockNumRsvd &&
+        while (dealtLenAccum < curBaseTileSize && gatheredYBlockIdx < yBlockNumSparse &&
                oriYBlockIdx < yBlockNumAval && oriStartOffset < kvSeqlen) {
             uint32_t curYBlockSize = blockShapeY;
             if (oriYBlockIdx == yBlockNumAval - 1) {
@@ -246,7 +246,7 @@ public:
                     GemmCoord actualOriShape,
                     uint32_t gatheredKvSTileIdx, uint32_t kvSeqlen,
                     uint32_t kvSBaseTile, uint32_t blockShapeY,
-                    uint32_t yBlockNumAval, uint32_t yBlockNumRsvd,
+                    uint32_t yBlockNumAval, uint32_t yBlockNumSparse,
                     uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages,
                     Arch::CrossCoreFlag smToMm2Flag, Arch::CrossCoreFlag mm2ToReFlag)
     {
@@ -269,7 +269,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
         SparseVBaseTileL1FullLoad(
             gBTensor, l1BTensorTla, gSparseBlockIdx, gatheredKvSTileIdx, kvSeqlen, kvSBaseTile, blockShapeY,
-            yBlockNumAval, yBlockNumRsvd, curBaseTileSize, embed);
+            yBlockNumAval, yBlockNumSparse, curBaseTileSize, embed);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         // fwd crossCoreSync from online sm to mm2
@@ -280,7 +280,7 @@ public:
         uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
-        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe separately.
+        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
         // therefore, FixPipe won't launch until each portion(chunked only by columns, based on nbuffer strategy)
         // of the base tile is ready on l0C
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
@@ -366,7 +366,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
             // 需要kernel传输ubCTensor的时候确保其shape的m，n是满足32B（8个32位元素）对齐的
-            // rounded up by 8 and split in half to each AIV
+            // rounded up by 8 and splited in half to each AIV
             // valid rows in AIV0: [0, mFixPAligned8 / 2 - 1]
             // valid rows in AIV1: [mFixPAligned8 / 2, rowNum - 1]
             uint32_t mFixPAligned8 = RoundUp(rowNum, 8);
@@ -387,7 +387,7 @@ public:
                     GemmCoord actualOriShape,
                     uint32_t gatheredKvSTileIdx, uint32_t kvSeqlen,
                     uint32_t kvSBaseTile, uint32_t blockShapeY,
-                    uint32_t yBlockNumAval, uint32_t yBlockNumRsvd,
+                    uint32_t yBlockNumAval, uint32_t yBlockNumSparse,
                     uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages,
                     Arch::CrossCoreFlag smToMm2Flag, Arch::CrossCoreFlag mm2ToReFlag, uint64_t deqScalar)
     {
@@ -411,7 +411,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
         SparseVBaseTileL1FullLoad(
             gBTensor, l1BTensorTla, gSparseBlockIdx, gatheredKvSTileIdx, kvSeqlen, kvSBaseTile, blockShapeY,
-            yBlockNumAval, yBlockNumRsvd, curBaseTileSize, embed);
+            yBlockNumAval, yBlockNumSparse, curBaseTileSize, embed);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         // fwd crossCoreSync from online sm to mm2
@@ -422,7 +422,7 @@ public:
         uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
-        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe separately.
+        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
         // therefore, FixPipe won't launch until each portion(chunked only by columns, based on nbuffer strategy)
         // of the base tile is ready on l0C
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
@@ -508,7 +508,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
             // 需要kernel传输ubCTensor的时候确保其shape的m，n是满足32B（8个32位元素）对齐的
-            // rounded up by 8 and split in half to each AIV
+            // rounded up by 8 and splited in half to each AIV
             // valid rows in AIV0: [0, mFixPAligned8 / 2 - 1]
             // valid rows in AIV1: [mFixPAligned8 / 2, rowNum - 1]
             uint32_t mFixPAligned8 = RoundUp(rowNum, 8);

@@ -18,6 +18,7 @@ namespace NpuArch::Epilogue
 {
 
 enum class LseMode {NONE = 0, OUT_ONLY = 1};
+enum class LseFormat {TN1 = 0, BNS1 = 1, BSN1 = 2};
 // For AtlasA2, FA Infer online Softmax
 template <LseMode LSE_MODE_, typename SM_DTYPE_>
 struct EpilogueAtlasA2OnlineSoftmax {
@@ -44,8 +45,13 @@ struct EpilogueOnlineSoftmaxBsa {
     using ArchTag = Arch::AtlasA5;
 };
 
+template <
+    LseMode LSE_MODE_ = LseMode::NONE,
+    LseFormat LSE_FORMAT_ = LseFormat::TN1>
 struct EpilogueAtlasA5BsaRescaleO {
     using ArchTag = Arch::AtlasA5;
+    static constexpr LseMode LSE_MODE = LSE_MODE_;
+    static constexpr LseFormat LSE_FORMAT = LSE_FORMAT_;
 };
 
 }  // namespace NpuArch::Epilogue
