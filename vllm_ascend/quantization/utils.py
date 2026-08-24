@@ -36,6 +36,13 @@ from vllm_ascend.utils import (
 QUANT_DTYPES = (torch_npu.float4_e2m1fn_x2, torch_npu.hifloat8)
 SCALE_DTYPES = (torch_npu.float8_e8m0fnu,)
 
+_DYNAMIC_MX_QUANT_SCALE_ALG_CACHE: int | None = None
+
+
+def reset_dynamic_mx_quant_scale_alg_cache() -> None:
+    global _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE
+    _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE = None
+
 
 def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     """Select the MX scale algorithm used by DynamicMxQuantV3.
@@ -44,8 +51,16 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     maximum absolute value. ``scale_alg=1`` first maps that maximum to the
     destination FP8 range, then rounds the E8M0 scale exponent up to avoid
     quantization overflow. MiniMax M3 checkpoints require the latter.
+
+    The result is cached process-wide because it only depends on the
+    device type and the model config, both fixed after engine init.
     """
+    global _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE
+    if _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE is not None:
+        return _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE
+
     if get_ascend_device_type() != AscendDeviceType.A5:
+        _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE = 0
         return 0
 
     if vllm_config is None:
@@ -63,8 +78,12 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
         any(isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures)
         or model_type == "minimax_m3"
     ):
-        return 1
-    return 0
+        result = 1
+    else:
+        result = 0
+
+    _DYNAMIC_MX_QUANT_SCALE_ALG_CACHE = result
+    return result
 
 
 def get_model_file(
