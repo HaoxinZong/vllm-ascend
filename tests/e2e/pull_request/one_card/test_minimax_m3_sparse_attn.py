@@ -13,7 +13,7 @@ Select one backend with::
 
 Test cases are adapted from
 ``reference/vllm_cp/tests/kernels/attention/test_minimax_m3.py`` and
-``csrc/attention/sparse_attention_score/tests/test_bf16.py``.
+``csrc/attention/generic_block_sparse_attention/tests/test_bf16.py``.
 """
 
 from __future__ import annotations
