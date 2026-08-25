@@ -1246,8 +1246,14 @@ def init_ascend_config(vllm_config):
         # Publish the fully validated singleton before invalidating derived
         # process caches. The next runtime read rebuilds them from new_config;
         # failed construction leaves the previous singleton/cache untouched.
+        from vllm_ascend.quantization.utils import (
+            get_dynamic_mx_quant_scale_alg,
+            reset_dynamic_mx_quant_scale_alg_cache,
+        )
         from vllm_ascend.utils import clear_enable_sp
 
+        reset_dynamic_mx_quant_scale_alg_cache()
+        get_dynamic_mx_quant_scale_alg(vllm_config)
         clear_enable_sp()
     else:
         logger.warning("Ascend config instance is not fully initialized. action: skip singleton cache update. ")
