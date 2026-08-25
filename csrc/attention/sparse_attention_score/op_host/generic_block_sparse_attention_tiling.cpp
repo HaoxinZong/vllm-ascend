@@ -19,7 +19,6 @@
 #include "graph/types.h"
 #include "graph/tensor.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "op_host/tiling_base.h"
 
 constexpr int QUERY_INDEX = 0;
 constexpr int KEY_INDEX = 1;
