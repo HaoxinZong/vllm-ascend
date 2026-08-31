@@ -127,7 +127,7 @@ class TestMultimodalImageTokenIndex:
             hf_text_config=SimpleNamespace(model_type="minimax_m3"),
         ),
         SimpleNamespace(
-            hf_text_config=SimpleNamespace(),
+            hf_text_config=SimpleNamespace(model_type="minimax_m3_text"),
             hf_config=SimpleNamespace(model_type="minimax_m3_vl"),
         ),
     ],
