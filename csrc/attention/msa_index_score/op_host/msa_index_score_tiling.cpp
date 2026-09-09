@@ -58,6 +58,32 @@ inline uint32_t RoundUpU32(uint32_t value, uint32_t align)
     return (value + align - 1) / align * align;
 }
 
+// 950 MIX：按估计 M-task 数启动 AIC，避免短 decode 打满空核（scheduler.Init GetValue / MODE4 VC 空转）。
+// Host 读不到 per-request q_len。kernel TotalTasks = Σ CeilDiv(qLen_b * Hq, MSA_ROW_TILE_M)。
+// Σ ceil(x_i) <= ceil(Σ x_i) + B；B=1 时 packed == actual。B>1 用 packed+B 上界，避免少估把
+// 多 tile 请求串到已启动核上。A2/A3 仍打满 AIC。
+inline uint32_t EstLaunchAic(const MsaIndexScoreInfo &info, uint32_t aicNum)
+{
+    if (info.totalQ == 0U || aicNum == 0U) {
+        return 1U;
+    }
+    const uint64_t packedRows = static_cast<uint64_t>(info.totalQ) * static_cast<uint64_t>(info.numQHeads);
+    const uint32_t packedM =
+        static_cast<uint32_t>((packedRows + static_cast<uint64_t>(MSA_ROW_TILE_M) - 1U) / MSA_ROW_TILE_M);
+    uint32_t est = packedM;
+    if (info.batch > 1U) {
+        const uint32_t add = packedM + info.batch;
+        est = (add < packedM) ? aicNum : add;
+    }
+    if (est < 1U) {
+        est = 1U;
+    }
+    if (est > aicNum) {
+        est = aicNum;
+    }
+    return est;
+}
+
 inline uint64_t GetDefaultStride0(const gert::Shape &shape)
 {
     uint64_t stride = 1;
@@ -432,6 +458,13 @@ ge::graphStatus DoTiling(gert::TilingContext *context, const MsaIndexScoreInfo &
     const uint32_t kScratchBytes = useKScratch ? (aicNum * kScratchElems * scratchElemBytes) : 0U;
     const uint32_t kScratchOffsetElems = sWsBytes / sizeof(float);
 
+    uint32_t launchAic = aicNum;
+    if (info.totalQ == 0U) {
+        launchAic = 1U;
+    } else if (info.isAscend950) {
+        launchAic = EstLaunchAic(info, aicNum);
+    }
+
     MsaIndexScoreTilingData tilingData;
     tilingData.set_batch(info.batch);
     tilingData.set_totalQ(info.totalQ);
@@ -442,7 +475,7 @@ ge::graphStatus DoTiling(gert::TilingContext *context, const MsaIndexScoreInfo &
     tilingData.set_blockSize(info.blockSize);
     tilingData.set_maxBlocksPerBatch(info.maxBlocksPerBatch);
     tilingData.set_scoreBlockStride(scoreBlockStride);
-    tilingData.set_usedCoreNum(aicNum);
+    tilingData.set_usedCoreNum(launchAic);
     tilingData.set_isQuant(info.isQuant ? 1U : 0U);
     tilingData.set_sparseMode(info.sparseMode);
     tilingData.set_initBlocks(info.initBlocks);
@@ -484,10 +517,17 @@ ge::graphStatus DoTiling(gert::TilingContext *context, const MsaIndexScoreInfo &
 
     // MIX 1AIC:2AIV：CalcTschBlockDim 的 sliceNum 按 AIV 计数，内部再 / (aiv/aic)。
     // 传入 aicNum 会再除一次得到 blockDim=aic/2，只能打一半 Cube。
-    // sliceNum = aivNum。
-    // 整 batch q_len=0：totalQ==0 → BlockDim=1，避免 totalTaskNum=0。
+    // 整 batch q_len=0：queryS==0 → BlockDim=1，避免 totalTaskNum=0。
+    // 950：sliceNum = launchAic * 2，短 decode 只起实际 M-task 对应的 MIX；
+    // 多 M-tile / 大 batch 仍打满 AIC。A2/A3 保持 sliceNum=aivNum。
     if (info.totalQ == 0U) {
         context->SetBlockDim(1);
+    } else if (info.isAscend950) {
+        uint32_t sliceAiv = launchAic * MSA_AIV_PER_AIC;
+        if (sliceAiv > aivNum) {
+            sliceAiv = aivNum;
+        }
+        context->SetBlockDim(ascendcPlatform.CalcTschBlockDim(sliceAiv, aicNum, aivNum));
     } else {
         context->SetBlockDim(ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum));
     }
@@ -514,8 +554,9 @@ ge::graphStatus DoTiling(gert::TilingContext *context, const MsaIndexScoreInfo &
         tilingKey = (info.queryDtype == ge::DT_BF16) ? MSA_TILING_KEY_BF16 : MSA_TILING_KEY_FP16;
     }
     context->SetTilingKey(tilingKey);
-    OP_LOGI(context->GetNodeName(), "MsaIndexScore tilingKey=%lu headDim=%u layout=%u strideKvBlock=%u", tilingKey,
-            info.headDim, info.keyLayout, strideKvBlock);
+    OP_LOGI(context->GetNodeName(),
+            "MsaIndexScore tilingKey=%lu headDim=%u layout=%u strideKvBlock=%u launchAic=%u aicNum=%u", tilingKey,
+            info.headDim, info.keyLayout, strideKvBlock, launchAic, aicNum);
     return ge::GRAPH_SUCCESS;
 }
 } // namespace

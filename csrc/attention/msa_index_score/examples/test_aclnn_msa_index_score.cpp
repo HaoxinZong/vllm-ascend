@@ -13,7 +13,8 @@
  * \brief aclnnMsaIndexScore 调用示例，内置 CPU golden 做端到端精度自验证。
  *
  * 用例矩阵覆盖：Prefill 多 M-tile、prefix 非 128 对齐的边界 block、varlen 多 batch、
- * Decode(q_len=1)、投机解码(q_len>1)、长序列多 S-tile 轮转、block_table 乱序、
+ * Decode(q_len=1)、投机解码(q_len>1)、短 decode（Hq=4 / 宽 block_table）、
+ * 长序列多 S-tile 轮转、block_table 乱序、
  * 无效尾填充、q_len/kv_len=0 的 mixed-batch pad、bf16 / fp16 双 dtype、
  * int8 key 前融合反量化、PA BNBD、TND packed key、A2/A3 与 950 PA key dim0 非连续。
  */
@@ -909,6 +910,66 @@ int main()
          0,
          1,
          257},
+        // 短 decode：少量 M-tile + 可选宽 block_table（对齐 vLLM decode 类输入）。
+        {"L0-decode-q4-kv4", 4, 128, 4, {4}, {4}, {16}, false, false},
+        {"L0-decode-q4-kv4-b2", 4, 128, 8, {4, 4}, {4, 8}, {16, 16}, false, false},
+        {"L0-decode-q4-kv4-table275",
+         4,
+         128,
+         4,
+         {4},
+         {4},
+         {16},
+         false,
+         false,
+         kSparseModeRightDown,
+         KeyLayout::BBND,
+         0,
+         1,
+         275},
+        {"L0-fp8-decode-q4-kv4", 4, 128, 4, {4}, {4}, {16}, false, false, kSparseModeRightDown, KeyLayout::BBND, 1},
+        {"L0-fp8-decode-q4-kv4-table275",
+         4,
+         128,
+         4,
+         {4},
+         {4},
+         {16},
+         false,
+         false,
+         kSparseModeRightDown,
+         KeyLayout::BBND,
+         1,
+         1,
+         275},
+        {"L0-fp8-decode-q1-kv4-table275",
+         4,
+         128,
+         4,
+         {1},
+         {4},
+         {16},
+         false,
+         false,
+         kSparseModeRightDown,
+         KeyLayout::BBND,
+         1,
+         1,
+         275},
+        {"L0-fp8-decode-q4-kv128-table275",
+         4,
+         128,
+         4,
+         {4},
+         {128},
+         {16},
+         false,
+         false,
+         kSparseModeRightDown,
+         KeyLayout::BBND,
+         1,
+         1,
+         275},
     };
 
     size_t passed = 0;
