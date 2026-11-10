@@ -496,9 +496,7 @@ def test_dspark_draft_uses_local_rope_and_stable_metadata_buffers(monkeypatch):
 
     for actual, expected in zip(prefill, ml4.gather_mla_rope(table, positions)):
         torch.testing.assert_close(actual, expected)
-    for actual, expected, old in zip(
-        updated, ml4.gather_mla_rope(table, torch.tensor([4, 5])), decode
-    ):
+    for actual, expected, old in zip(updated, ml4.gather_mla_rope(table, torch.tensor([4, 5])), decode):
         torch.testing.assert_close(actual, expected)
         assert actual.data_ptr() == old.data_ptr()
 

@@ -422,17 +422,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         q_li = q_li.view(-1, self.n_head, self.head_dim)
         return self.apply_indexer_rope(q_li, cos, sin)
 
-    def apply_indexer_rope(
-        self, states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> torch.Tensor:
+    def apply_indexer_rope(self, states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Apply the same rotation and output layout to indexer queries and keys."""
         rope_dim = self.qk_rope_head_dim
         if rope_dim == 0:
             return states
         if HAS_TRITON:
-            return rope_forward_triton_siso(
-                states, cos, sin, rope_dim=rope_dim, is_neox_style=self.is_rope_neox_style
-            )
+            return rope_forward_triton_siso(states, cos, sin, rope_dim=rope_dim, is_neox_style=self.is_rope_neox_style)
 
         rotary, tail = states.split([rope_dim, self.head_dim - rope_dim], dim=-1)
         rotary = rotary.unsqueeze(2)
