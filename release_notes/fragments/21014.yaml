@@ -19,6 +19,7 @@ entries:
     text: >-
       Fixed Mistral Large 4 DSpark draft RoPE and BF16 weight loading, and enforced its
       sliding attention window in eager and graph decode without decode context parallelism.
+      Fixed a draft graph replay crash when data-parallel synchronization reduces a dummy batch.
     model: mistral-large-4
     hardware: [Ascend 950]
   - category: performance
