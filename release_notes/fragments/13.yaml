@@ -1,0 +1,6 @@
+pr: 13
+entries:
+  - category: bugfix
+    text: >-
+      Adapt Mistral Large 4 DSpARK to the vLLM 0.34 release branch on Ascend,
+      including Model Runner V2, ACLGraph, and draft FlashMLA KV cache setup.
