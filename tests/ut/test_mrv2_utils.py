@@ -24,6 +24,12 @@ import vllm_ascend.mrv2_utils as mrv2_utils
 from vllm_ascend.mrv2_utils import use_v2_model_runner
 
 
+def test_v2_is_selected_without_legacy_runner_selector(monkeypatch):
+    monkeypatch.setattr(mrv2_utils, "envs_vllm", SimpleNamespace())
+
+    assert use_v2_model_runner(SimpleNamespace())
+
+
 @pytest.mark.parametrize("env_value", [True, False])
 def test_environment_override_wins(monkeypatch, env_value):
     monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", env_value)

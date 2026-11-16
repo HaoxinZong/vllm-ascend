@@ -73,7 +73,9 @@ def _upstream_carries_replay_start() -> bool:
     thing this patch needs to exist; a pin without it has nothing to carry and
     nothing to fill.
     """
-    return hasattr(Scheduler, "_mark_prefix_replay")
+    # v0.34 re-sends resumed requests as NewRequestData, which carries replay_start.
+    parameters = inspect.signature(Scheduler._make_cached_request_data).parameters
+    return hasattr(Scheduler, "_mark_prefix_replay") and "resumed_reqs" in parameters
 
 
 def _add_dataclass_field(cls: type, name: str, factory: type, annotation: type) -> None:

@@ -90,10 +90,11 @@ from vllm_ascend.utils import (
     vllm_version_is,
     weak_ref_tensors,
 )
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 
 BUILD_METADATA_STEP_PREFILL = 0

@@ -18,12 +18,11 @@ _ASCEND_V1_SUPPORTED_FEATURES = frozenset(
 
 # Both supported vLLM versions expose this helper.
 # Runner selection and upstream V2 validation stay in mrv2_utils.
-_original_get_v1_model_runner_unsupported_features = VllmConfig._get_v1_model_runner_unsupported_features
+if hasattr(VllmConfig, "_get_v1_model_runner_unsupported_features"):
+    _original_get_v1_model_runner_unsupported_features = VllmConfig._get_v1_model_runner_unsupported_features
 
+    def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
+        unsupported = _original_get_v1_model_runner_unsupported_features(self)
+        return [feature for feature in unsupported if feature not in _ASCEND_V1_SUPPORTED_FEATURES]
 
-def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
-    unsupported = _original_get_v1_model_runner_unsupported_features(self)
-    return [feature for feature in unsupported if feature not in _ASCEND_V1_SUPPORTED_FEATURES]
-
-
-VllmConfig._get_v1_model_runner_unsupported_features = _patched_get_v1_model_runner_unsupported_features
+    VllmConfig._get_v1_model_runner_unsupported_features = _patched_get_v1_model_runner_unsupported_features

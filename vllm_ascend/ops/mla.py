@@ -285,14 +285,15 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
 
         original_process_weights = self.mla_attn.process_weights_after_loading
 
-        def wrapped_process_weights(act_dtype: torch.dtype):
+        def wrapped_process_weights() -> None:
             from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
+            act_dtype = self.mla_attn.act_dtype
             if self.dcp_q_replicate_enabled:
                 self.mla_attn.impl.process_weights_after_loading(act_dtype)
             elif not isinstance(self.mla_attn.impl, AscendSFAImpl):
                 # Both supported vLLM versions dispatch to the impl here.
-                original_process_weights(act_dtype)
+                original_process_weights()
             else:
                 # SFA disposes kv_b_proj, so bypass upstream's dense packing.
                 self.mla_attn.impl.process_weights_after_loading(act_dtype)

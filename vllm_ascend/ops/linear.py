@@ -242,6 +242,8 @@ class AscendQKVParallelLinear(QKVParallelLinear):
             disable_tp=disable_tp,
         )
 
+        self.loaded_shard_ids: dict[str, set[str | int]] = {}
+
     def forward(
         self,
         input_,
@@ -295,6 +297,9 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+
+        self.shard_ids = tuple(range(len(output_sizes)))
+        self.loaded_shard_ids: dict[str, set[str | int]] = {}
 
     def forward(
         self,

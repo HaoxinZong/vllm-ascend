@@ -272,12 +272,9 @@ class AscendCompiler(CompilerInterface):
 
     name = "AscendCompiler"
 
-    # TODO(wxs): add passes related to compilation in compute_hash
-    def compute_hash(self, vllm_config: VllmConfig) -> str:
+    def compile_factors(self, vllm_config: VllmConfig) -> dict[str, str | bool]:
         self.vllm_config = vllm_config
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
-        from hashlib import sha256
-
         import torch_npu
 
         factors = {
@@ -287,7 +284,7 @@ class AscendCompiler(CompilerInterface):
             "enable_super_kernel": ascend_compilation_config.enable_super_kernel,
         }
         logger.info("AscendCompiler hash factors: %s", factors)
-        return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
+        return factors
 
     def initialize_cache(self, cache_dir: str, disable_cache: bool = False, prefix: str = "") -> None:
         """Initialize cache settings and runtime state before compiling or loading a graph."""

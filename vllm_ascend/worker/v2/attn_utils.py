@@ -1048,7 +1048,7 @@ def _uses_single_raw_mla_cache(
         return False
     if not kv_cache_spec.supports_single_raw_backing:
         return False
-    if not supports_component_major_mla_pd(vllm_config) or enable_sfa(vllm_config):
+    if not supports_component_major_mla_pd(vllm_config):
         return False
 
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])
@@ -1068,7 +1068,8 @@ def _uses_single_raw_mla_cache(
         # The external reader retains its fused-cache contract, including
         # DCP. Native FIA continues to follow the dependency's exclusions.
         return True
-    return supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
+    # Target SFA does not constrain the FlashMLA draft's own cache.
+    return not enable_sfa(vllm_config) and supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
 
 
 def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable[KVCacheSpec]) -> bool:
@@ -1633,6 +1634,8 @@ def allocate_kv_cache_main(
     device: torch.device,
     layout: Any,
     kernel_block_sizes: list[int],
+    *,
+    allocate=None,
 ) -> dict[str, Any]:
     """Allocate Ascend KV cache through vLLM main's #51718 entry point.
 
@@ -1641,6 +1644,8 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
+    if allocate is not None:
+        raise NotImplementedError("This Ascend KV allocator requires standard allocations")
     del layout
     vllm_config = get_current_vllm_config()
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)

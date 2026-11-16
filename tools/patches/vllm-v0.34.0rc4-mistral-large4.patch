@@ -1,0 +1,61 @@
+diff --git a/vllm/compilation/monitor.py b/vllm/compilation/monitor.py
+index 647ca23993ce10663c20b981e6b028f97765502e..70e0d01aeab1a2b85c8051749ea33ad9e14767e8 100644
+--- a/vllm/compilation/monitor.py
++++ b/vllm/compilation/monitor.py
+@@ -93,3 +93,17 @@ def monitor_profiling_run(tag: str = "") -> Generator[None, None, None]:
+         log_prefix,
+         elapsed,
+     )
++
++
++# Compatibility for vLLM Ascend ACL graph capture callers.
++cudagraph_capturing_enabled: bool = True
++
++
++def validate_cudagraph_capturing_enabled() -> None:
++    if not cudagraph_capturing_enabled:
++        raise RuntimeError("Graph capture is currently disabled.")
++
++
++def set_cudagraph_capturing_enabled(enabled: bool) -> None:
++    global cudagraph_capturing_enabled
++    cudagraph_capturing_enabled = enabled
+diff --git a/vllm/models/mistral/mistral_large4/__init__.py b/vllm/models/mistral/mistral_large4/__init__.py
+index faa4455e4710b9f4969e8f1ee2ee8cbbc6738fc2..ffa9711b627cc7695fd637d9962177ce89eb5a75 100644
+--- a/vllm/models/mistral/mistral_large4/__init__.py
++++ b/vllm/models/mistral/mistral_large4/__init__.py
+@@ -21,7 +21,7 @@ elif current_platform.is_cuda():
+     from .nvidia.model import MistralLarge4ForCausalLM  # noqa: E402
+
+     __all__.append("MistralLarge4DSparkForCausalLM")
+-elif current_platform.is_rocm():
++elif current_platform.is_rocm() or current_platform.device_type == "npu":
+     from .amd.dspark import (
+         MistralLarge4DSparkForCausalLM,  # type: ignore[assignment]  # noqa: F401
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index dc03e318d8c2a739f9f8c713293ec2c2101e97d0..4bf81b64766be690718a3e6f018a25ce10f05b75 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
++from copy import copy
++
+ import torch.nn as nn
+
+ from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
+@@ -90,8 +92,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+         vllm_config.attention_config.backend,
+     )
+
++    draft_compilation_config = copy(vllm_config.compilation_config)
++    draft_compilation_config.cudagraph_capture_sizes = None
++    draft_compilation_config.max_cudagraph_capture_size = None
+     draft_vllm_config = replace(
+         vllm_config,
++        compilation_config=draft_compilation_config,
+         parallel_config=_get_dspark_parallel_config(
+             vllm_config.parallel_config,
+             speculative_config.draft_parallel_config.tensor_parallel_size,

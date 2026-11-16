@@ -64,7 +64,6 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     wait_for_device_metadata,
 )
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -74,6 +73,7 @@ if TYPE_CHECKING:
         dspark_swa_indices_supported,
     )
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms
+    from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.dspark_swa_indices import (  # noqa: F811

@@ -86,6 +86,10 @@ def use_v2_model_runner(vllm_config: VllmConfig) -> bool:
 
     Set ``VLLM_USE_V2_MODEL_RUNNER=0`` to force V1.
     """
+    # vLLM v0.34 removed the V1 runner and its environment selector.
+    if not hasattr(envs_vllm, "VLLM_USE_V2_MODEL_RUNNER"):
+        return True
+
     env_override = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
     if env_override is not None:
         logger.info_once(

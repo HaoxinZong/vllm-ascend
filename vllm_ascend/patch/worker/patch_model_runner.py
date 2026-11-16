@@ -155,7 +155,6 @@ def initialize_kv_cache(
         attn_cg_support.min_cg_support,
         attn_cg_support.min_cg_attn_backend,
         self.decode_query_len,
-        use_v2_model_runner=True,
         kv_cache_config=self.kv_cache_config,
         max_num_reqs=self.max_num_reqs,
         is_profiling=is_profiling,
@@ -166,7 +165,7 @@ def initialize_kv_cache(
         self.vllm_config,
         self.device,
         cudagraph_mode,
-        decode_query_len=self.decode_query_len,
+        decode_query_lens=self.vllm_config.get_decode_cudagraph_query_lens(self.decode_query_len),
         lora_capture_cases=self.lora_capture_cases,
         varlen_decode=self.adaptive_verification is not None,
         ubatch_runner=self.ubatch_runner,
@@ -208,9 +207,14 @@ def initialize_kv_cache(
         for tensor in (cache if isinstance(cache, (tuple, list)) else (cache,))
         if tensor is not None and tensor.device == self.device
     ]
+    self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
+    self.replayssm_block_copy_tensors = upstream.get_replayssm_block_copy_tensors(
+        self.compilation_config.static_forward_context
+    )
     if is_profiling:
         self.kv_connector = upstream.NO_OP_KV_CONNECTOR
     else:
+        self.kv_caches_by_layer = kv_caches_dict
         self.kv_connector = upstream.get_kv_connector(self.vllm_config, kv_caches_dict)
         # vLLM main carries routed-experts output through the AuxOutput
         # connector, which the V2 NPUModelRunner relies on via super().

@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from importlib.util import find_spec
+
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -44,7 +46,8 @@ import vllm_ascend.patch.worker.patch_step3p5  # noqa
 # MRv1-only patches. Every module imported below targets a symbol that is only
 # reachable through the V1 Model Runner, so deleting the `patch_v1` package
 # removes all V1 patch support in one step.
-import vllm_ascend.patch.worker.patch_v1  # noqa
+if find_spec("vllm.v1.cudagraph_dispatcher") is not None:
+    import vllm_ascend.patch.worker.patch_v1  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa

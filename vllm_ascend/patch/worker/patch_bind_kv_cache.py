@@ -54,7 +54,8 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
     # vLLM #52506 adds ReplaySSM ring trackers on main.
-    utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
+    if hasattr(utils, "share_replayssm_ring_trackers"):
+        utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 
 
 def bind_kv_cache_to_layers(
@@ -78,4 +79,5 @@ def bind_kv_cache_to_layers(
         else:
             layer.kv_cache = kv_cache
     ordered_layer_names = sorted(kv_caches, key=lambda name: extract_layer_index(name, num_attn_module))
-    utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
+    if hasattr(utils, "share_replayssm_ring_trackers"):
+        utils.share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)

@@ -1536,7 +1536,7 @@ def graph_manager_wrapper(model_runner):
         vllm_config: VllmConfig,
         device: torch.device,
         cudagraph_mode: CUDAGraphMode,
-        decode_query_len: int,
+        decode_query_lens: dict[int, int],
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: Any = None,  # vLLM main (#51700)
@@ -1545,7 +1545,7 @@ def graph_manager_wrapper(model_runner):
             vllm_config,
             device,
             cudagraph_mode,
-            decode_query_len,
+            decode_query_lens,
             model_runner,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
