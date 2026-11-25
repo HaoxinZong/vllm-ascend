@@ -2,6 +2,5 @@ pr: 17
 entries:
   - category: bugfix
     text: >-
-      Fixed Mistral Large 4 startup on Ascend when DSpARK draft attention uses a
-      sliding window. Affected vLLM 0.34.0 and CANN 9.3.0 environments can apply
-      the documented dependency compatibility patches during setup.
+      Fixed Mistral Large 4 startup failures on Ascend with DSpARK when draft
+      attention uses a sliding window or FlashMLA metadata reuse is enabled.
