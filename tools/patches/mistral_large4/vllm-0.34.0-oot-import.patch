@@ -1,0 +1,12 @@
+--- a/vllm/models/mistral/mistral_large4/__init__.py
++++ b/vllm/models/mistral/mistral_large4/__init__.py
+@@ -28,6 +28,9 @@
+     from .amd.model import MistralLarge4ForCausalLM  # type: ignore[assignment]
+ 
+     __all__.append("MistralLarge4DSparkForCausalLM")
++elif current_platform.is_out_of_tree():
++    # Hardware plugins import the implementation they adapt explicitly.
++    __all__ = []
+ else:
+     raise NotImplementedError(
+         "Mistral Large 4 is only supported on NVIDIA and AMD GPUs."

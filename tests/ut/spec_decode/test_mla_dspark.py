@@ -178,6 +178,7 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
 
     def set_attn(self, model_state, kv_cache_config, block_tables, input_buffers, target_attn_groups):
         assert target_attn_groups is target_groups
+        self.model_state = model_state
         self.attn_groups = draft_groups
 
     monkeypatch.setattr(DSparkSpeculator, "set_attn", set_attn)
@@ -189,7 +190,7 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
 
     monkeypatch.setattr(shared, "get_layers_from_vllm_config", get_layers)
     cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["target", "draft"])])
-    spec.set_attn(None, cache_config, None, None, target_groups)
+    spec.set_attn(SimpleNamespace(), cache_config, None, None, target_groups)
     assert spec._context_slot_mappings.dtype == torch.int32
     return spec
 

@@ -1,0 +1,2 @@
+# Preserve the intentional space prefixes on blank unified-diff context lines.
+tools/patches/mistral_large4/*.patch -whitespace

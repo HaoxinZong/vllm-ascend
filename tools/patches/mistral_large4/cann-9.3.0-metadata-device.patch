@@ -1,0 +1,102 @@
+--- a/cann_ops_transformer/ops/attention/quant_lightning_indexer_v2/quant_lightning_indexer.py
++++ b/cann_ops_transformer/ops/attention/quant_lightning_indexer_v2/quant_lightning_indexer.py
+@@ -11,17 +11,15 @@
+ import torch
+ from torch.library import impl
+ from cann_ops_transformer.op_builder import OpBuilder, get_as_library
++from cann_ops_transformer.utils.metadata_device import get_metadata_core_counts
+ 
+ 
+ QLI_METADATA_EXTENSION_SIZE = 256
+ 
+ 
+ def _calculate_metadata_size(device=None):
+-    properties = torch.npu.get_device_properties(device)
+-    return (
+-        8 * (1 + properties.cube_core_num + properties.vector_core_num)
+-        + QLI_METADATA_EXTENSION_SIZE
+-    )
++    aic_cores, aiv_cores = get_metadata_core_counts(device)
++    return 8 * (1 + aic_cores + aiv_cores) + QLI_METADATA_EXTENSION_SIZE
+ 
+ 
+ QLI_METADATA_OP_NAME = "quant_lightning_indexer_metadata"
+--- a/cann_ops_transformer/ops/attention/flash_mla/flash_mla.py
++++ b/cann_ops_transformer/ops/attention/flash_mla/flash_mla.py
+@@ -11,17 +11,13 @@
+ import torch
+ from torch.library import impl
+ from cann_ops_transformer.op_builder import OpBuilder, get_as_library
++from cann_ops_transformer.utils.metadata_device import get_metadata_core_counts
+ 
+ MLA_METADATA_OP_NAME = "flash_mla_metadata"
+ 
+ 
+-def _get_core_nums():
+-    """从硬件获取 AIC/AIV 核数（与 aclnn host 侧 GetCurrentPlatformInfo 同源）。"""
+-    try:
+-        properties = torch.npu.get_device_properties()
+-        return properties.cube_core_num, properties.vector_core_num
+-    except Exception:
+-        return 128, 128
++def _get_core_nums(device=None):
++    return get_metadata_core_counts(device)
+ 
+ 
+ def _calculate_batch_size(cache_seqlens: torch.Tensor):
+@@ -183,7 +179,7 @@
+ ):
+     """Dispatch FlashMla metadata generation to NPU."""
+     b_size = _calculate_batch_size(cache_seqlens)
+-    aic_core_num, aiv_core_num = _get_core_nums()
++    aic_core_num, aiv_core_num = _get_core_nums(cache_seqlens.device)
+ 
+     max_seqlen_q = -1 if max_seqlen_q is None else max_seqlen_q
+     max_seqlen_kv = -1 if max_seqlen_kv is None else max_seqlen_kv
+--- /dev/null
++++ b/cann_ops_transformer/utils/metadata_device.py
+@@ -0,0 +1,44 @@
++"""Resolve the per-device core counts used by CANN metadata schedulers."""
++
++from functools import lru_cache
++
++import acl
++import torch
++
++# aclrtDevAttr values from acl/acl_rt.h, rather than SKU core capacities.
++ACL_DEV_ATTR_AICORE_CORE_NUM = 101
++ACL_DEV_ATTR_VECTOR_CORE_NUM = 201
++ACL_SUCCESS = 0
++
++
++@lru_cache(maxsize=None)
++def _query_metadata_core_counts(device_index: int) -> tuple[int, int]:
++    counts = []
++    for attribute in (ACL_DEV_ATTR_AICORE_CORE_NUM, ACL_DEV_ATTR_VECTOR_CORE_NUM):
++        count, status = acl.rt.get_device_info(device_index, attribute)
++        if status != ACL_SUCCESS or count <= 0:
++            raise RuntimeError(
++                f"Cannot query metadata core count for device {device_index}, "
++                f"attribute {attribute}: status={status}, count={count}"
++            )
++        counts.append(count)
++    return counts[0], counts[1]
++
++
++def get_metadata_core_counts(device=None) -> tuple[int, int]:
++    # Torch owns runtime initialization; do not initialize/finalize ACL here.
++    current = torch.npu.current_device()
++    if device is None:
++        device_index = current
++    elif isinstance(device, bool):
++        raise TypeError("A metadata device must be an index or an NPU device")
++    elif isinstance(device, int):
++        device_index = device
++    else:
++        resolved = torch.device(device)
++        if resolved.type != "npu":
++            raise ValueError(f"Metadata requires an NPU device, got {resolved}")
++        device_index = current if resolved.index is None else resolved.index
++    if device_index < 0:
++        raise ValueError(f"Invalid metadata device index: {device_index}")
++    return _query_metadata_core_counts(device_index)

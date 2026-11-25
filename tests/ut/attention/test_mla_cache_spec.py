@@ -209,3 +209,43 @@ def test_worker_customizes_spec_once_without_reading_impl(monkeypatch, backend, 
     assert actual.head_size == source.head_size + 1
     expected_alignment = alignment if alignment is not None else MultipleOf(128)
     assert actual.block_stride_alignment == expected_alignment
+
+
+@pytest.mark.parametrize("retained_tokens,bounded_replay", [(0, False), (7, False), (0, True)])
+def test_mla_windowed_draft_keeps_full_context_cache(monkeypatch, retained_tokens, bounded_replay):
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.fa_quant_layer = False
+    impl.dtype = torch.bfloat16
+    layer = _make_owner(impl, AscendMLABackend)
+    layer.kv_cache_dtype = "auto"
+    layer.head_size = layer.kv_lora_rank + layer.qk_rope_head_dim
+    layer.sliding_window = 4099
+    layer.non_causal_multi_token_decode = True
+    layer.is_draft_layer = True
+    layer.indexer = None
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            max_model_len=128000,
+            hf_text_config=SimpleNamespace(model_type="mistral_large4"),
+        ),
+        cache_config=SimpleNamespace(block_size=128),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    source = MLAAttention.get_kv_cache_spec(layer, config)
+    source = replace(source, extra_retained_tokens=retained_tokens, bounded_replay=bounded_replay)
+    monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source)
+    if bounded_replay:
+        with pytest.raises(NotImplementedError, match="bounded replay"):
+            layer.get_kv_cache_spec(config)
+        return
+
+    actual = layer.get_kv_cache_spec(config)
+    assert isinstance(actual, AscendMLAAttentionSpec)
+    assert actual.sliding_window == layer.sliding_window
+    assert actual.non_causal_multi_token_decode
+    assert (
+        actual.max_memory_usage_bytes(config)
+        == config.model_config.max_model_len // actual.block_size * actual.page_size_bytes
+    )
