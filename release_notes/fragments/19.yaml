@@ -1,0 +1,9 @@
+pr: 19
+entries:
+  - category: bugfix
+    text: >-
+      On Ascend 950 (A5), MegaMoe configurations with expert FFN widths above
+      4096, including 6144, no longer fall back solely because of that width.
+      MegaMoe still requires the existing enable_fused_mc2=2 or 3 opt-in setting
+      and a CANN operator supporting the requested shape.
+    hardware: [A5]
