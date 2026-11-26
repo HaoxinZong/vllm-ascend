@@ -1233,10 +1233,8 @@ class AscendConfig:
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
         """Unified MegaMoe config eligibility check for A3 and A5.
 
-        The A3 and A5 MegaMoe operators are converging on the same supported
-        ranges, so this check intentionally uses one set of bounds for both
-        platforms. Where the operators currently differ, the stricter bound is
-        applied and the per-platform actuals are documented inline.
+        Use shared bounds where possible and check hardware capabilities
+        where the supported shapes differ.
         """
         # Guard against early-init phases where model_config is still None
         # (derive_and_validate may run before it is populated; other validators
@@ -1284,15 +1282,21 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        # intermediate_hidden (the post-activation intermediate width) must be in
-        # [256, 4096] and aligned to 128.
-        # Actual operator bounds: A5 supports [256, 4096] aligned to 128; the A3
-        # operator only supports [512, 3072] aligned to 256. The unified A5-style
-        # bound is kept here; tighten per-platform if A3 rejects a passing model.
+        # This is the post-activation expert width. Keep the minimum and
+        # alignment checks on every platform; platforms with wider expert
+        # support leave the upper bound to the operator.
         moe_intermediate_size = int(moe_intermediate_size)
-        if not (256 <= moe_intermediate_size <= 4096) or moe_intermediate_size % 128 != 0:
+        if moe_intermediate_size < 256 or moe_intermediate_size % 128 != 0:
             logger.warning(
-                "MegaMoe requires moe_intermediate_size in [256, 4096] aligned to 128; got %s.",
+                "MegaMoe requires moe_intermediate_size of at least 256 aligned to 128; got %s.",
+                moe_intermediate_size,
+            )
+            return False
+        if moe_intermediate_size > 4096 and not get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE_UNBOUNDED_INTERMEDIATE
+        ):
+            logger.warning(
+                "MegaMoe requires moe_intermediate_size <= 4096 on this hardware; got %s.",
                 moe_intermediate_size,
             )
             return False

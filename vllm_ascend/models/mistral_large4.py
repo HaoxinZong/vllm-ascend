@@ -58,7 +58,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_ep_group
-from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -780,19 +779,6 @@ def validate_moe_parallelism(vllm_config: VllmConfig) -> None:
                 f"divide evenly across the {ep_size}-rank expert-parallel "
                 f"group."
             )
-
-    # Expert width 6144 is outside the MegaMoe window ([256, 4096] aligned to
-    # 128), so the fused MoE declines and the generic grouped-matmul path runs.
-    # That is correct, only slower, and the warning MegaMoe logs on its own
-    # says nothing about why this model in particular misses it.
-    moe_width = getattr(hf_config, "moe_intermediate_size", None)
-    if moe_width is not None and not (256 <= int(moe_width) <= 4096):
-        logger.info(
-            "Mistral Large 4: expert width %s is outside the MegaMoe window "
-            "[256, 4096], so the routed experts run on the generic "
-            "grouped-matmul path rather than the fused one.",
-            moe_width,
-        )
 
 
 class MistralLarge4MixtureOfExperts(MixtureOfExperts):

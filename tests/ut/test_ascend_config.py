@@ -1594,6 +1594,56 @@ class TestSubconfigPydanticTypeValidation(TestBase):
 
 
 class TestUpstreamConfigCompatibility(TestBase):
+    def test_megamoe_expert_width_limits_follow_hardware_capabilities(self):
+        text_config = SimpleNamespace(hidden_size=8192, moe_intermediate_size=6144, num_experts_per_tok=8)
+        vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["MistralLarge4ForCausalLM"],
+                hf_text_config=text_config,
+                get_num_experts=lambda: 128,
+            ),
+            parallel_config=SimpleNamespace(world_size_across_dp=16, pipeline_parallel_size=1),
+        )
+        for device_type, width, expected in (
+            (AscendDeviceType.A5, 128, False),
+            (AscendDeviceType.A5, 256, True),
+            (AscendDeviceType.A5, 257, False),
+            (AscendDeviceType.A5, 4096, True),
+            (AscendDeviceType.A5, 4224, True),
+            (AscendDeviceType.A5, 6144, True),
+            (AscendDeviceType.A5, 6145, False),
+            (AscendDeviceType.A5, 12288, True),
+            (AscendDeviceType.A3, 4096, True),
+            (AscendDeviceType.A3, 4224, False),
+            (AscendDeviceType.A3, 6144, False),
+            (AscendDeviceType.A2, 4096, True),
+            (AscendDeviceType.A2, 6144, False),
+        ):
+            with (
+                self.subTest(device_type=device_type, width=width),
+                patch(
+                    "vllm_ascend.ascend_config.get_current_hardware_profile",
+                    return_value=get_hardware_profile(device_type),
+                ),
+            ):
+                text_config.moe_intermediate_size = width
+                self.assertEqual(AscendConfig._is_megamoe_supported_by_config(vc), expected)
+
+        text_config.moe_intermediate_size = 6144
+        with patch(
+            "vllm_ascend.ascend_config.get_current_hardware_profile",
+            return_value=get_hardware_profile(AscendDeviceType.A5),
+        ):
+            for field, value in (("hidden_size", 896), ("num_experts_per_tok", 33), ("moe_quantize", "unsupported")):
+                with self.subTest(field=field), patch.object(text_config, field, value, create=True):
+                    self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+            for world_size in (1, 3):
+                with (
+                    self.subTest(world_size=world_size),
+                    patch.object(vc.parallel_config, "world_size_across_dp", world_size),
+                ):
+                    self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
     @patch(
         "vllm_ascend.ascend_config.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A5),
@@ -1609,7 +1659,7 @@ class TestUpstreamConfigCompatibility(TestBase):
         vc = SimpleNamespace(model_config=model_config, parallel_config=parallel_config)
         self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
 
-        for field, value in (("hidden_size", 896), ("intermediate_size", 4224), ("num_experts_per_tok", 33)):
+        for field, value in (("hidden_size", 896), ("intermediate_size", 6145), ("num_experts_per_tok", 33)):
             with self.subTest(field=field), patch.object(text_config, field, value):
                 self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
         for world_size in (1, 3):
@@ -1618,14 +1668,19 @@ class TestUpstreamConfigCompatibility(TestBase):
 
         model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
         self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
-        # The intermediate-size check is a plain range + alignment rule now, so
-        # 6144-wide first projections are accepted for every architecture.
-        text_config.moe_intermediate_size = 3072
+        for width in (1024, 3072, 4608):
+            with self.subTest(width=width):
+                text_config.moe_intermediate_size = width
+                self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+
+        model_config.architectures = ["MistralLarge4ForCausalLM"]
+        text_config.moe_intermediate_size = 6144
         self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
-        text_config.moe_intermediate_size = 4608
-        self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
-        text_config.moe_intermediate_size = 1024
-        self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        with patch(
+            "vllm_ascend.ascend_config.get_current_hardware_profile",
+            return_value=get_hardware_profile(AscendDeviceType.A3),
+        ):
+            self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
 
     @patch(
         "vllm_ascend.ascend_config.get_current_hardware_profile",
@@ -1716,7 +1771,7 @@ class TestUpstreamConfigCompatibility(TestBase):
                 # K3-specific fields must not change the legacy decision.
                 self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
                 for field, value in (
-                    ("moe_intermediate_size", 4608),
+                    ("moe_intermediate_size", 128),
                     ("moe_intermediate_size", None),
                     ("num_experts_per_tok", 33),
                 ):

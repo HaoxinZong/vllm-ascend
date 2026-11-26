@@ -459,12 +459,9 @@ def test_fused_mc2_is_not_rejected():
 # ------------------------------------------------------------- MoE layout
 
 
-def _moe_config(enable_ep=False, n_routed_experts=128, moe_intermediate_size=6144):
+def _moe_config(enable_ep=False, n_routed_experts=128):
     parallel = SimpleNamespace(enable_expert_parallel=enable_ep)
-    hf = SimpleNamespace(
-        n_routed_experts=n_routed_experts,
-        moe_intermediate_size=moe_intermediate_size,
-    )
+    hf = SimpleNamespace(n_routed_experts=n_routed_experts)
     return SimpleNamespace(
         parallel_config=parallel,
         model_config=SimpleNamespace(hf_config=hf),
@@ -494,20 +491,6 @@ def test_the_expert_group_is_not_consulted_when_expert_parallel_is_off(monkeypat
     monkeypatch.setattr(ml4, "get_ep_group", _boom)
 
     ml4.validate_moe_parallelism(_moe_config(enable_ep=False, n_routed_experts=127))
-
-
-def test_the_megamoe_fallback_is_reported_once(caplog):
-    with caplog.at_level("INFO"):
-        ml4.validate_moe_parallelism(_moe_config(moe_intermediate_size=6144))
-
-    assert "grouped-matmul" in caplog.text
-
-
-def test_an_expert_width_inside_the_window_reports_nothing(caplog):
-    with caplog.at_level("INFO"):
-        ml4.validate_moe_parallelism(_moe_config(moe_intermediate_size=2048))
-
-    assert "grouped-matmul" not in caplog.text
 
 
 def test_a_dense_config_is_left_alone(monkeypatch):

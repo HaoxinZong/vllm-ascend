@@ -78,6 +78,8 @@ class HardwareCapability(Enum):
     # layouts (CANN_MEGAMOE_MXFP), A3 (arch22) uses the INT8 W8A8 layout. Both
     # assume the shared and routed experts share a residual width.
     CANN_MEGAMOE_SHARED_EXPERT_FUSION = auto()
+    # Allow expert widths above the framework's legacy 4096 ceiling.
+    CANN_MEGAMOE_UNBOUNDED_INTERMEDIATE = auto()
     # Split a mixed chunked-prefill batch into separate prefill and decode FIA calls.
     CHUNKED_PREFILL_PHASE_SPLIT = auto()
     # CANN device-side FlashAttn metadata with strided paged GQA K/V.
@@ -522,6 +524,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.CANN_MEGAMOE,
                     HardwareCapability.CANN_MEGAMOE_MXFP,
                     HardwareCapability.CANN_MEGAMOE_SHARED_EXPERT_FUSION,
+                    HardwareCapability.CANN_MEGAMOE_UNBOUNDED_INTERMEDIATE,
                     HardwareCapability.DEVICE_LENGTH_FLASH_ATTN,
                     HardwareCapability.FLASH_ATTN_NPU_3,
                     HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT,
